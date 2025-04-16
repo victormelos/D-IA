@@ -1,0 +1,23 @@
+=== ESTATÍSTICAS DA IA ===
+Profundidade Máxima Configurada: 12
+Profundidade Completada: 10
+Profundidade Real Atingida: 10
+Nós Visitados (Minimax): 101826
+Nós Visitados (Quiescence): 72333
+Total de Nós: 174159
+TT Hits: 6428
+Podas Alpha: 13404
+Podas Beta: 62863
+Tempo Total: 9.02s
+Nós por segundo: 19311
+
+Tempo por Nível de Profundidade:
+  - Nível 1: 9.0146s
+  - Nível 2: 8.9982s
+  - Nível 3: 8.8954s
+  - Nível 4: 8.7647s
+  - Nível 5: 8.5158s
+  - Nível 6: 8.1145s
+  - Nível 7: 7.5785s
+  - Nível 8: 6.4410s
+  - Nível 9: 5.0460s
