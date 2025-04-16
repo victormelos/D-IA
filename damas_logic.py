@@ -61,6 +61,7 @@ class EstadoLanceDesfazer(NamedTuple):
     foi_promovido: bool
     hash_anterior: int
     damas_recem_promovidas_adicionadas: Set[Posicao] = set()  # Damas adicionadas neste movimento
+    troca_turno: bool = True  # NOVO: indica se houve troca de turno
 class TTEntry(NamedTuple):
     profundidade: int; score: float; flag: int; melhor_movimento: Optional[Movimento] = None
 
@@ -219,7 +220,7 @@ class Tabuleiro:
             except IndexError: print(f"Erro idx id_caps: {mov}"); continue
         return caps
 
-    def _fazer_lance(self, mov: Movimento) -> EstadoLanceDesfazer:
+    def _fazer_lance(self, mov: Movimento, troca_turno: bool = True) -> EstadoLanceDesfazer:
         o=mov[0]; d=mov[-1]; h_a=self.hash_atual; p_o=self.get_peca(o); c=Peca.get_cor(p_o); t_o=Peca.get_tipo(p_o)
         pc=self.identificar_pecas_capturadas(mov); self.mover_peca(o,d);
         for pos_c in pc: self.remover_peca(pos_c)
@@ -229,21 +230,21 @@ class Tabuleiro:
             nv=DB if c==BRANCO else DP;
             self.set_peca(d,nv);
             pr=True
-            # Marcar a dama como recém-promovida e retornar a informação
-            # para que o método executar_lance_completo na classe Partida
-            # possa tratar e encerrar o turno
             self.damas_recem_promovidas.add(d)
             damas_adicionadas.add(d)
-        self._atualizar_hash_turno(); return EstadoLanceDesfazer(mov,p_o,pc,pr,h_a,damas_adicionadas)
+        if troca_turno:
+            self._atualizar_hash_turno()
+        return EstadoLanceDesfazer(mov,p_o,pc,pr,h_a,damas_adicionadas, troca_turno)
 
     def _desfazer_lance(self, e: EstadoLanceDesfazer):
         self.hash_atual=e.hash_anterior; mov=e.movimento; o=mov[0]; d=mov[-1]; p_r=e.peca_movida_original
         self.grid[d[0]][d[1]]=VAZIO; self.grid[o[0]][o[1]]=p_r;
         for pos_c,val_c in e.pecas_capturadas.items(): self.grid[pos_c[0]][pos_c[1]] = val_c
-        # Remover damas recém-promovidas que foram adicionadas neste movimento
         for pos in e.damas_recem_promovidas_adicionadas:
             if pos in self.damas_recem_promovidas:
                 self.damas_recem_promovidas.remove(pos)
+        if e.troca_turno:
+            self._atualizar_hash_turno()
 
     def calcular_mobilidade_futura(self, r: int, c: int, cor: int, tipo: int) -> int:
         """
@@ -511,7 +512,7 @@ class Tabuleiro:
                     # Essa jogada do adversário captura (r,c).
                     # Vamos simular no tabuleiro fictício
                     tab_temp = self.criar_copia()
-                    state_desf = tab_temp._fazer_lance(cap_seq)
+                    state_desf = tab_temp._fazer_lance(cap_seq, troca_turno=True)  # Simulação: troca_turno=True pois é lance "normal"
                     nova_pos = cap_seq[-1]
                     # Checar se nós temos algum movimento de captura que pega nova_pos
                     posicoes_nossas = tab_temp.get_posicoes_pecas(cor_peca)
@@ -581,11 +582,11 @@ class Tabuleiro:
         # 1º lance: para cada movimento do oponente
         for mov1 in self.encontrar_movimentos_possiveis(cor_oponente):
             tab_temp1 = self.criar_copia()
-            tab_temp1._fazer_lance(mov1)
+            tab_temp1._fazer_lance(mov1, troca_turno=True)
             # 2º lance: para cada resposta do próprio jogador
             for mov_resp in tab_temp1.encontrar_movimentos_possiveis(cor_peca):
                 tab_temp2 = tab_temp1.criar_copia()
-                tab_temp2._fazer_lance(mov_resp)
+                tab_temp2._fazer_lance(mov_resp, troca_turno=True)
                 # Agora, o oponente tenta capturar em 2 lances
                 for mov2 in tab_temp2.encontrar_movimentos_possiveis(cor_oponente):
                     capturas2 = tab_temp2.identificar_pecas_capturadas(mov2)
@@ -621,13 +622,21 @@ class Partida:
     def executar_lance_completo(self, movimento: Movimento) -> bool:
         if not self.movimentos_legais_atuais or movimento not in self.movimentos_legais_atuais: print(f"Erro: Mov inválido Partida: {movimento}"); return False
         jogador_antes = self.jogador_atual
-        estado_desfazer = self.tabuleiro._fazer_lance(movimento);
-        houve_captura = bool(estado_desfazer.pecas_capturadas); foi_movimento_pedra = (Peca.get_tipo(estado_desfazer.peca_movida_original) == PEDRA)
+        # Determinar se haverá troca de turno
+        houve_captura = False
+        foi_promovido = False
+        tipo_final = None
+        pos_final = movimento[-1]
+        peca_final = self.tabuleiro.get_peca(pos_final)
+        tipo_final = Peca.get_tipo(peca_final)
+        # Verifica se há capturas possíveis a partir da posição final (combo)
+        estado_desfazer = self.tabuleiro._fazer_lance(movimento, troca_turno=True)  # Default: troca_turno
+        houve_captura = bool(estado_desfazer.pecas_capturadas)
+        foi_movimento_pedra = (Peca.get_tipo(estado_desfazer.peca_movida_original) == PEDRA)
         foi_promovido = estado_desfazer.foi_promovido
         if houve_captura or foi_movimento_pedra: self.contador_lances_sem_progresso = 0
         else: self.contador_lances_sem_progresso += 1
         self.total_lances += 1
-        # Se houve promoção para dama, passa o turno imediatamente para o adversário
         if foi_promovido:
             print(f"[REGRA] Peça promovida a dama em {Tabuleiro.pos_para_alg(movimento[-1])}. Passando turno para adversário.")
             self.jogador_atual = Tabuleiro.get_oponente(jogador_antes)
@@ -635,20 +644,18 @@ class Partida:
             self._atualizar_movimentos_legais()
             self._verificar_fim_de_jogo()
             return True
-        # --- LÓGICA DE COMBO DE CAPTURA ---
         if houve_captura:
             pos_final = movimento[-1]
             peca_final = self.tabuleiro.get_peca(pos_final)
             tipo_final = Peca.get_tipo(peca_final)
-            # Verifica se há capturas possíveis a partir da posição final
             capturas_combo = self.tabuleiro._encontrar_capturas_recursivo(pos_final, self.jogador_atual, tipo_final, [pos_final], set())
             if capturas_combo:
-                # Só permite continuar o combo a partir da peça que acabou de capturar
+                # Combo: não troca turno nem hash
                 self.movimentos_legais_atuais = [c for c in capturas_combo if len(c) > 1]
-                # Não troca o turno, obriga a continuação do combo
+                # Refaz o lance sem troca de turno/hash
+                self.tabuleiro._desfazer_lance(estado_desfazer)
+                estado_desfazer = self.tabuleiro._fazer_lance(movimento, troca_turno=False)
                 return True
-        # --- Fim da lógica de combo ---
-        # A lógica original
         self.jogador_atual = Tabuleiro.get_oponente(jogador_antes)
         self._atualizar_movimentos_legais()
         self._verificar_fim_de_jogo()
@@ -756,7 +763,7 @@ class MotorIA:
                     if self.verificar_tempo(): raise TempoExcedidoError("Tempo excedido durante avaliação de movimentos")
                     
                     # Usar o mesmo tabuleiro para todos os movimentos (melhor desempenho)
-                    estado_d = tab_copia._fazer_lance(mov)
+                    estado_d = tab_copia._fazer_lance(mov, troca_turno=True)
                     jog_apos = Tabuleiro.get_oponente(cor_ia)
                     cap = bool(estado_d.pecas_capturadas)
                     pd = (Peca.get_tipo(estado_d.peca_movida_original)==PEDRA)
@@ -871,7 +878,7 @@ class MotorIA:
             atacante = tab.get_peca(m[0])
             # Simular o tabuleiro após a captura
             tab_temp = tab.criar_copia()
-            tab_temp._fazer_lance(m)
+            tab_temp._fazer_lance(m, troca_turno=True)
             if tab_temp.eh_peca_vulneravel(r, c):
                 # Penaliza pelo valor da peça atacante
                 valor -= (VALOR_DAMA if abs(atacante) == 2 else VALOR_PEDRA)
@@ -883,25 +890,30 @@ class MotorIA:
         melhor_val = -float('inf'); melhor_mov_local = None
         # Loop Alpha-Beta NegaMax
         for mov in movs_ordenados:
-            estado_d=tab._fazer_lance(mov)
-            cp=bool(estado_d.pecas_capturadas)
+            # Determinar se haverá troca de turno
+            cp=bool(tab.identificar_pecas_capturadas(mov))
+            pos_final = mov[-1]
+            peca_final = tab.get_peca(pos_final)
+            tipo_final = Peca.get_tipo(peca_final)
+            capturas_combo = tab._encontrar_capturas_recursivo(pos_final, jog, tipo_final, [pos_final], set()) if cp else []
+            troca_turno = not (cp and capturas_combo)
+            estado_d=tab._fazer_lance(mov, troca_turno=troca_turno)
             pd=Peca.get_tipo(estado_d.peca_movida_original)==PEDRA
-            ct_p=0 if cp or pd else cont_emp+1
-            # --- LÓGICA CORRETA DE TROCA DE JOGADOR/COMBO ---
-            if cp:
-                pos_final = mov[-1]
-                peca_final = tab.get_peca(pos_final)
-                tipo_final = Peca.get_tipo(peca_final)
-                capturas_combo = tab._encontrar_capturas_recursivo(pos_final, jog, tipo_final, [pos_final], set())
-                if capturas_combo:
-                    prox_jogador = jog
-                    prox_prof = prof
-                else:
-                    prox_jogador = Tabuleiro.get_oponente(jog)
-                    prox_prof = prof - 1
+            # Determinar próximo jogador e profundidade
+            if cp and capturas_combo:
+                prox_jogador = jog
+                prox_prof = prof
             else:
                 prox_jogador = Tabuleiro.get_oponente(jog)
                 prox_prof = prof - 1
+            # Ajuste correto do contador de empates
+            if prox_jogador != jog:
+                if cp or pd:
+                    ct_p = 0
+                else:
+                    ct_p = cont_emp + 1
+            else:
+                ct_p = cont_emp
             score = -self.minimax(tab, ct_p, prox_prof, -beta, -alpha, prox_jogador, cor_ia)
             tab._desfazer_lance(estado_d)
             if score > melhor_val: melhor_val = score; melhor_mov_local = mov
@@ -949,10 +961,14 @@ class MotorIA:
         score_final_q = stand_pat
         if is_max:
             for mov in mov_caps:
-                estado_d = tab._fazer_lance(mov)
-                # Extensão: se o MESMO jogador ainda tiver capturas, não reduz prof_q nem troca turno
-                capturas_combo = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
-                if capturas_combo:
+                cp=bool(tab.identificar_pecas_capturadas(mov))
+                pos_final = mov[-1]
+                peca_final = tab.get_peca(pos_final)
+                tipo_final = Peca.get_tipo(peca_final)
+                capturas_combo = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True) if cp else []
+                troca_turno = not (cp and capturas_combo)
+                estado_d = tab._fazer_lance(mov, troca_turno=troca_turno)
+                if cp and capturas_combo:
                     prox_prof_q = prof_q
                     prox_jog = jog_q
                 else:
@@ -964,9 +980,14 @@ class MotorIA:
                 if b <= a: break
         else:
             for mov in mov_caps:
-                estado_d = tab._fazer_lance(mov)
-                capturas_combo = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
-                if capturas_combo:
+                cp=bool(tab.identificar_pecas_capturadas(mov))
+                pos_final = mov[-1]
+                peca_final = tab.get_peca(pos_final)
+                tipo_final = Peca.get_tipo(peca_final)
+                capturas_combo = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True) if cp else []
+                troca_turno = not (cp and capturas_combo)
+                estado_d = tab._fazer_lance(mov, troca_turno=troca_turno)
+                if cp and capturas_combo:
                     prox_prof_q = prof_q
                     prox_jog = jog_q
                 else:
