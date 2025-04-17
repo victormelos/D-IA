@@ -134,7 +134,8 @@ class Tabuleiro:
     def get_posicoes_pecas(self, c: int) -> List[Posicao]: return [(r,col) for r in range(TAMANHO_TABULEIRO) for col in range(TAMANHO_TABULEIRO) if Peca.get_cor(self.grid[r][col])==c]
 
     def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: Movimento, caps_cam: Set[Posicao]) -> List[Movimento]:
-        seqs=[]; op=self.get_oponente(cor); dirs=DIRECOES_DAMA
+        seqs=[]; op=self.get_oponente(cor); 
+        dirs = DIRECOES_CAPTURA_PEDRA if tipo == PEDRA else DIRECOES_DAMA
         for dr,dc in dirs:
             if tipo==PEDRA:
                 pc=(pos_a[0]+dr,pos_a[1]+dc); pd=(pos_a[0]+2*dr,pos_a[1]+2*dc);
@@ -340,6 +341,7 @@ class Tabuleiro:
         debug_info = []  # Lista para armazenar logs de debug
         # Definir as posições de borda
         bordas = [(0, 1), (0, 3), (0, 5), (0, 7), (1, 0), (2, 7), (3, 0), (4, 7), (5, 0), (6, 7), (7, 0), (7, 2), (7, 4), (7, 6)]
+        cache_vulneravel = {}
         for r in range(TAMANHO_TABULEIRO):
             for c in range(TAMANHO_TABULEIRO):
                 p = self.grid[r][c]
@@ -352,7 +354,7 @@ class Tabuleiro:
                     else: md+=1
                     debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp==PEDRA else 'DAMA', 'bônus': {}}
                     val = 0.0
-                    vulneravel = self.eh_peca_vulneravel(r,c)
+                    vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
                     protegida = self.eh_peca_protegida(r,c)
                     # Penalidade de vulnerabilidade: só para peças fora da base
                     if vulneravel and not (tp==PEDRA and ((cor_p==BRANCO and r in [0,1]) or (cor_p==PRETO and r in [TAMANHO_TABULEIRO-1,TAMANHO_TABULEIRO-2]))):
@@ -415,7 +417,7 @@ class Tabuleiro:
                     bonus_aliado += prestes
                     debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
                     val += prestes
-                    borda = BONUS_PECA_NA_BORDA if pos in bordas else 0
+                    borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
                     bonus_aliado += borda
                     debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
                     val += borda
@@ -451,7 +453,7 @@ class Tabuleiro:
         nova_copia = Tabuleiro(estado_inicial=False)  # Cria um tabuleiro vazio
         nova_copia.grid = [linha[:] for linha in self.grid]  # Copia profunda da grade
         nova_copia.hash_atual = self.hash_atual
-        nova_copia.damas_recem_promovidas = self.damas_recem_promovidas.copy()  # Copia as damas recém-promovidas
+        nova_copia.damas_recem_promovidas = set()  # Não propaga damas recém-promovidas para buscas
         return nova_copia
 
     def limpar_damas_recem_promovidas_por_cor(self, cor: int):
@@ -471,13 +473,20 @@ class Tabuleiro:
         for pos in damas_para_remover:
             self.damas_recem_promovidas.remove(pos)
 
-    def eh_peca_vulneravel(self, r: int, c: int) -> bool:
+    def eh_peca_vulneravel(self, r: int, c: int, cache_vulneravel: dict = None) -> bool:
         """
         Retorna True se a peça em (r, c) pode ser capturada
         no próximo lance do adversário (captura imediata).
+        Usa cache local para evitar recomputação em nós de avaliação.
         """
+        if cache_vulneravel is None:
+            cache_vulneravel = {}
+        chave = (self.hash_atual, r, c)
+        if chave in cache_vulneravel:
+            return cache_vulneravel[chave]
         cor_peca = Peca.get_cor(self.grid[r][c])
         if cor_peca == VAZIO:
+            cache_vulneravel[chave] = False
             return False
         cor_oponente = self.get_oponente(cor_peca)
         posicoes_oponente = self.get_posicoes_pecas(cor_oponente)
@@ -488,7 +497,9 @@ class Tabuleiro:
             for cap_seq in capturas_pos_op:
                 pecas_capturadas = self.identificar_pecas_capturadas(cap_seq)
                 if (r, c) in pecas_capturadas:
+                    cache_vulneravel[chave] = True  # Early-exit e cache
                     return True
+        cache_vulneravel[chave] = False
         return False
 
     def eh_peca_protegida(self, r: int, c: int) -> bool:
@@ -761,14 +772,17 @@ class MotorIA:
             try:
                 for mov in movs_ord_raiz:
                     if self.verificar_tempo(): raise TempoExcedidoError("Tempo excedido durante avaliação de movimentos")
-                    
-                    # Usar o mesmo tabuleiro para todos os movimentos (melhor desempenho)
-                    estado_d = tab_copia._fazer_lance(mov, troca_turno=True)
-                    jog_apos = Tabuleiro.get_oponente(cor_ia)
-                    cap = bool(estado_d.pecas_capturadas)
+                    # Determinar se haverá troca de turno
+                    cp = bool(tab_copia.identificar_pecas_capturadas(mov))
+                    pos_final = mov[-1]
+                    peca_final = tab_copia.get_peca(pos_final)
+                    tipo_final = Peca.get_tipo(peca_final)
+                    capturas_combo = tab_copia._encontrar_capturas_recursivo(pos_final, cor_ia, tipo_final, [pos_final], set()) if cp else []
+                    troca_turno = not (cp and capturas_combo)
+                    estado_d = tab_copia._fazer_lance(mov, troca_turno=troca_turno)
+                    jog_apos = Tabuleiro.get_oponente(cor_ia) if troca_turno else cor_ia
                     pd = (Peca.get_tipo(estado_d.peca_movida_original)==PEDRA)
-                    ct_p = 0 if cap or pd else partida.contador_lances_sem_progresso+1
-                    
+                    ct_p = 0
                     score = -self.minimax(tab_copia, ct_p, prof_atual - 1, -beta, -alpha, jog_apos, cor_ia) # NegaMax
                     tab_copia._desfazer_lance(estado_d)  # Desfazer o movimento após análise
                     
@@ -832,6 +846,7 @@ class MotorIA:
         return self.melhor_movimento_atual
 
     def minimax(self, tab: Tabuleiro, cont_emp: int, prof: int, alpha: float, beta: float, jog: int, cor_ia: int) -> float:
+        print(f"[minimax] prof={prof} cont_emp={cont_emp} jogador={jog} hash={tab.hash_atual:x}")
         # Verificar tempo periodicamente (a cada 100 nós)
         if self.nos_visitados % 100 == 0 and self.verificar_tempo():
             raise TempoExcedidoError("Tempo excedido durante minimax")
@@ -871,17 +886,17 @@ class MotorIA:
             capturadas = tab.identificar_pecas_capturadas(m)
             if not capturadas:
                 return 0
-            valor = sum(VALOR_DAMA if abs(v) == 2 else VALOR_PEDRA for v in capturadas.values())
-            # Penalizar se a peça atacante ficar vulnerável após a captura
-            destino = m[-1]
-            r, c = destino
             atacante = tab.get_peca(m[0])
-            # Simular o tabuleiro após a captura
-            tab_temp = tab.criar_copia()
-            tab_temp._fazer_lance(m, troca_turno=True)
-            if tab_temp.eh_peca_vulneravel(r, c):
-                # Penaliza pelo valor da peça atacante
-                valor -= (VALOR_DAMA if abs(atacante) == 2 else VALOR_PEDRA)
+            tipo_atacante = abs(atacante)
+            valor = 0
+            for v in capturadas.values():
+                tipo_capturado = abs(v)
+                if tipo_capturado == DAMA and tipo_atacante == PEDRA:
+                    valor += VALOR_DAMA + 10  # Pedra captura dama: ótimo
+                elif tipo_capturado == DAMA and tipo_atacante == DAMA:
+                    valor += VALOR_DAMA
+                elif tipo_capturado == PEDRA:
+                    valor += VALOR_PEDRA
             return valor
         mov_caps.sort(key=valor_captura, reverse=True)
         mov_nao_caps = [m for m in movs if m not in mov_caps]
