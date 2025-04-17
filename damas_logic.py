@@ -43,6 +43,29 @@ BONUS_FORMACAO_PONTE = 0.3
 BONUS_FORMACAO_LANCA = 0.2
 BONUS_FORMACAO_PAREDE = 0.5
 
+# Tabelas Piece-Square (PSQT)
+PSQT_PEDRA = [
+    [ 0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.00],
+    [ 0.00,  0.05,  0.05,  0.05,  0.05,  0.05,  0.05,  0.00],
+    [ 0.00,  0.05,  0.10,  0.10,  0.10,  0.10,  0.05,  0.00],
+    [ 0.00,  0.05,  0.10,  0.15,  0.15,  0.10,  0.05,  0.00],
+    [ 0.00,  0.05,  0.10,  0.15,  0.15,  0.10,  0.05,  0.00],
+    [ 0.00,  0.05,  0.10,  0.10,  0.10,  0.10,  0.05,  0.00],
+    [ 0.00,  0.05,  0.05,  0.05,  0.05,  0.05,  0.05,  0.00],
+    [ 0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.00],
+]
+
+PSQT_DAMA = [
+    [ 0.00,  0.05,  0.05,  0.05,  0.05,  0.05,  0.05,  0.00],
+    [ 0.05,  0.10,  0.10,  0.10,  0.10,  0.10,  0.10,  0.05],
+    [ 0.05,  0.10,  0.15,  0.15,  0.15,  0.15,  0.10,  0.05],
+    [ 0.05,  0.10,  0.15,  0.20,  0.20,  0.15,  0.10,  0.05],
+    [ 0.05,  0.10,  0.15,  0.20,  0.20,  0.15,  0.10,  0.05],
+    [ 0.05,  0.10,  0.15,  0.15,  0.15,  0.15,  0.10,  0.05],
+    [ 0.05,  0.10,  0.10,  0.10,  0.10,  0.10,  0.10,  0.05],
+    [ 0.00,  0.05,  0.05,  0.05,  0.05,  0.05,  0.05,  0.00],
+]
+
 # Regra: Uma dama recém-promovida não pode se mover imediatamente, deve esperar o próximo turno do jogador
 # (após o adversário jogar). Esta regra é implementada utilizando o conjunto damas_recem_promovidas no tabuleiro.
 
@@ -90,7 +113,11 @@ class Tabuleiro:
         self.casas_centro_expandido = {(2,1),(2,3),(2,5),(3,2),(3,4),(4,3),(4,5),(5,2),(5,4),(5,6)}
         self.hash_atual: int = 0
         self.damas_recem_promovidas: Set[Posicao] = set()  # Conjunto para rastrear posições de damas recém-promovidas
+        self._cache_capturas = {}  # Cache local para capturas
         if estado_inicial: self.configuracao_inicial(); self.hash_atual = self.calcular_hash_zobrist_inicial()
+
+    def limpar_cache_capturas(self):
+        self._cache_capturas.clear()
 
     def configuracao_inicial(self):
         for r in range(TAMANHO_TABULEIRO):
@@ -134,7 +161,9 @@ class Tabuleiro:
     def get_posicoes_pecas(self, c: int) -> List[Posicao]: return [(r,col) for r in range(TAMANHO_TABULEIRO) for col in range(TAMANHO_TABULEIRO) if Peca.get_cor(self.grid[r][col])==c]
 
     def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: Movimento, caps_cam: list) -> List[Movimento]:
-        print(f"[RECURSÃO CAPTURA] de {Tabuleiro.pos_para_alg(pos_a)} com caps={caps_cam}")
+        key = (self.hash_atual, pos_a, cor, tipo, tuple(sorted(caps_cam)))
+        if key in self._cache_capturas:
+            return self._cache_capturas[key]
         seqs = []
         op = self.get_oponente(cor)
         dirs = DIRECOES_CAPTURA_PEDRA if tipo == PEDRA else DIRECOES_DAMA
@@ -144,15 +173,8 @@ class Tabuleiro:
                 pd = (pos_a[0] + 2 * dr, pos_a[1] + 2 * dc)
                 l_promo = 0 if cor == BRANCO else TAMANHO_TABULEIRO - 1
                 if self.is_valido(*pd) and Peca.get_cor(self.get_peca(pc)) == op and self.get_peca(pd) == VAZIO and pc not in caps_cam:
-                    # Simula a captura
                     novo_cam = cam_a + [pd]
                     novo_caps = caps_cam + [pc]
-                    # Tenta recursar mesmo após promoção, a menos que a regra obrigue a parar
-                    if pd[0] == l_promo:
-                        print(f"  → interrompe em promoção em {Tabuleiro.pos_para_alg(pd)} (mas tenta recursar)")
-                        # Se a regra exigir parar, descomente a linha abaixo:
-                        # seqs.append(novo_cam)
-                        # continue
                     cont = self._encontrar_capturas_recursivo(pd, cor, tipo, novo_cam, novo_caps)
                     if cont:
                         seqs.extend(cont)
@@ -165,8 +187,6 @@ class Tabuleiro:
                         break
                     peca_i = self.get_peca(pi)
                     if Peca.get_cor(peca_i) == op and pi not in caps_cam:
-                        # percorre TODAS as casas vazias além de pi,
-                        # gerando um movimento para cada pouso possível
                         for j in range(i + 1, TAMANHO_TABULEIRO):
                             pd = (pos_a[0] + j * dr, pos_a[1] + j * dc)
                             if not self.is_valido(*pd):
@@ -179,34 +199,29 @@ class Tabuleiro:
                                     seqs.extend(cont)
                                 else:
                                     seqs.append(novo_cam)
-                        # só interrompe a varredura de i DEPOIS de ter processado todos os pousos (j)
                         break
                     elif peca_i != VAZIO:
                         break
+        self._cache_capturas[key] = seqs
         return seqs
 
     def encontrar_movimentos_possiveis(self, cor: int, apenas_capturas: bool = False) -> List[Movimento]:
         all_capturas = []
         simples = []
         for pos_i in self.get_posicoes_pecas(cor):
-            # Ignorar damas recém-promovidas
             if pos_i in self.damas_recem_promovidas:
                 continue
             pv = self.get_peca(pos_i)
             tipo = Peca.get_tipo(pv)
             caps_peca = self._encontrar_capturas_recursivo(pos_i, cor, tipo, [pos_i], [])
-            # DEBUG: Mostrar info de capturas encontradas
             if caps_peca:
-                print(f"[DEBUG CAPTURAS] cor={cor}, pos={pos_i}, #seqs={len(caps_peca)}")
-                for seq in caps_peca:
-                    print("   →", [Tabuleiro.pos_para_alg(p) for p in seq])
                 all_capturas.extend(caps_peca)
+                pass
         if all_capturas:
             max_caps = max(len(seq)-1 for seq in all_capturas)
             return [seq for seq in all_capturas if len(seq)-1 == max_caps]
         if apenas_capturas:
             return []
-        # Gerar movimentos simples apenas se não houver capturas
         for pos_i in self.get_posicoes_pecas(cor):
             if pos_i in self.damas_recem_promovidas:
                 continue
@@ -229,13 +244,6 @@ class Tabuleiro:
                             simples.append([pos_i, pd])
                         else:
                             break
-        # DEBUG dos movimentos simples
-        if cor == PRETO:
-            movimentos_formatados = [f"{self.pos_para_alg(m[0])}->{self.pos_para_alg(m[1])}" for m in simples]
-            print(f"[DEBUG LOGIC] Mov Simples PRETO: {movimentos_formatados}")
-        elif cor == BRANCO:
-            movimentos_formatados = [f"{self.pos_para_alg(m[0])}->{self.pos_para_alg(m[1])}" for m in simples]
-            print(f"[DEBUG LOGIC] Mov Simples BRANCO: {movimentos_formatados}")
         return simples
 
     def identificar_pecas_capturadas(self, mov: Movimento) -> Dict[Posicao, int]:
@@ -368,114 +376,132 @@ class Tabuleiro:
         # Consideramos uma parede quando há pelo menos 3 peças conectadas
         return conta_conectadas >= 3
 
-    def avaliar_heuristica(self, cor_ref: int, debug_aval: bool = False) -> float:
-        s=0.0; op=self.get_oponente(cor_ref)
-        mp,md,opd,od=0,0,0,0
-        bonus_aliado,bonus_oponente=0.0,0.0
-        debug_info = []  # Lista para armazenar logs de debug
-        # Definir as posições de borda
+    def _heuristica_para_cor(self, cor_ref: int, debug: bool = False) -> float:
+        mp, md = 0, 0
+        bonus = 0.0
+        debug_info = []
         bordas = [(0, 1), (0, 3), (0, 5), (0, 7), (1, 0), (2, 7), (3, 0), (4, 7), (5, 0), (6, 7), (7, 0), (7, 2), (7, 4), (7, 6)]
         cache_vulneravel = {}
         for r in range(TAMANHO_TABULEIRO):
             for c in range(TAMANHO_TABULEIRO):
                 p = self.grid[r][c]
-                if p==VAZIO: continue
+                if p == VAZIO:
+                    continue
                 cor_p = Peca.get_cor(p)
                 tp = Peca.get_tipo(p)
                 pos = (r, c)
-                if cor_p==cor_ref:
-                    if tp==PEDRA: mp+=1
-                    else: md+=1
-                    debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp==PEDRA else 'DAMA', 'bônus': {}}
-                    val = 0.0
-                    vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
-                    protegida = self.eh_peca_protegida(r,c)
-                    # Penalidade de vulnerabilidade: só para peças fora da base
-                    if vulneravel and not (tp==PEDRA and ((cor_p==BRANCO and r in [0,1]) or (cor_p==PRETO and r in [TAMANHO_TABULEIRO-1,TAMANHO_TABULEIRO-2]))):
-                        bonus_aliado += PENALIDADE_PECA_VULNERAVEL
-                        debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
-                        val += PENALIDADE_PECA_VULNERAVEL
-                    # Bônus de proteção: só se realmente protegida (já é o caso)
-                    if protegida:
-                        bonus_aliado += BONUS_PECA_PROTEGIDA
-                        debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
-                        val += BONUS_PECA_PROTEGIDA
-                    # Bônus de mobilidade: só se tem pelo menos 1 movimento possível
-                    mov_fut = self.calcular_mobilidade_futura(r,c,cor_p,tp)
-                    if mov_fut > 0:
-                        bonus_aliado += mov_fut * BONUS_MOBILIDADE_FUTURA
-                        debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
-                        val += mov_fut * BONUS_MOBILIDADE_FUTURA
-                    # Bônus de bloqueio de avanço
-                    if self.detectar_bloqueio_avanco(r,c,cor_p):
-                        bonus_aliado += BONUS_BLOQUEIO_AVANCO
-                        debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
-                        val += BONUS_BLOQUEIO_AVANCO
-                    # Bônus de formação de parede: só se bloqueia avanço adversário
-                    if self.detectar_formacao_parede(r,c,cor_p) and self.detectar_bloqueio_avanco(r,c,cor_p):
-                        bonus_aliado += BONUS_FORMACAO_PAREDE
-                        debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
-                        val += BONUS_FORMACAO_PAREDE
-                    # Bônus de pedras conectadas: só se bloqueia avanço adversário
-                    if self.tem_pedras_conectadas(r,c) and self.detectar_bloqueio_avanco(r,c,cor_p):
-                        bonus_aliado += BONUS_PAR_PEDRAS_CONECTADAS
-                        debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
-                        val += BONUS_PAR_PEDRAS_CONECTADAS
-                    # Bônus de ponte: só se bloqueia avanço adversário
-                    if self.tem_formacao_ponte(r,c) and self.detectar_bloqueio_avanco(r,c,cor_p):
-                        bonus_aliado += BONUS_FORMACAO_PONTE
-                        debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
-                        val += BONUS_FORMACAO_PONTE
-                    l_av = r if cor_p==PRETO else (TAMANHO_TABULEIRO-1-r)
-                    avanco = l_av*BONUS_AVANCO_PEDRA if tp==PEDRA else 0
-                    bonus_aliado += avanco
-                    debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
-                    val += avanco
-                    centro = (BONUS_CONTROLE_CENTRO_DAMA if tp==DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
-                    bonus_aliado += centro
-                    debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
-                    val += centro
-                    l_seg_propria = 0 if cor_p==BRANCO else TAMANHO_TABULEIRO-1
-                    l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2}
-                    l_promo_iminente = 1 if cor_p==BRANCO else TAMANHO_TABULEIRO-2
-                    seg = BONUS_SEGURANCA_ULTIMA_LINHA if r==l_seg_propria else 0
-                    bonus_aliado += seg
-                    debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
-                    val += seg
-                    pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp==PEDRA and r in l_base_propria else 0
-                    bonus_aliado += pen_atrasada
-                    debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
-                    val += pen_atrasada
-                    # Bônus de promoção: só se não vulnerável
-                    prestes = BONUS_PRESTES_PROMOVER if tp==PEDRA and r==l_promo_iminente and not vulneravel else 0
-                    bonus_aliado += prestes
-                    debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
-                    val += prestes
-                    borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
-                    bonus_aliado += borda
-                    debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
-                    val += borda
-                    if tp==DAMA:
-                        mobilidade = sum(1 for dr,dc in DIRECOES_DAMA if self.is_valido(r+dr,c+dc) and self.get_peca((r+dr,c+dc))==VAZIO)
-                        mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
-                        bonus_aliado += mob_dama
-                        debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
-                        val += mob_dama
-                    debug_piece['score_parcial'] = val
-                    debug_info.append(debug_piece)
+                if cor_p != cor_ref:
+                    continue
+                if tp == PEDRA:
+                    mp += 1
                 else:
-                    pass  # Para debug, foque só no lado aliado
-        score = (mp*VALOR_PEDRA + md*VALOR_DAMA) - (opd*VALOR_PEDRA + od*VALOR_DAMA)
-        score += (bonus_aliado - bonus_oponente)
-        if debug_aval:
-            print("[DEBUG AVAL] Score material: {} ({} pedras, {} damas)".format(mp*VALOR_PEDRA + md*VALOR_DAMA, mp, md))
+                    md += 1
+                debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+                val = 0.0
+                tabela = PSQT_PEDRA if tp == PEDRA else PSQT_DAMA
+                if cor_ref == BRANCO:
+                    linha = r
+                else:
+                    linha = (TAMANHO_TABULEIRO - 1 - r)
+                mult = VALOR_PEDRA if tp == PEDRA else VALOR_DAMA
+                bonus_psqt = tabela[linha][c] * mult
+                bonus += bonus_psqt
+                debug_piece['bônus']['PSQT'] = bonus_psqt
+                val += bonus_psqt
+                vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+                protegida = self.eh_peca_protegida(r, c)
+                if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+                    bonus += PENALIDADE_PECA_VULNERAVEL
+                    debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+                    val += PENALIDADE_PECA_VULNERAVEL
+                if protegida:
+                    bonus += BONUS_PECA_PROTEGIDA
+                    debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+                    val += BONUS_PECA_PROTEGIDA
+                mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+                if mov_fut > 0:
+                    bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+                    debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+                    val += mov_fut * BONUS_MOBILIDADE_FUTURA
+                if self.detectar_bloqueio_avanco(r, c, cor_p):
+                    bonus += BONUS_BLOQUEIO_AVANCO
+                    debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+                    val += BONUS_BLOQUEIO_AVANCO
+                if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+                    bonus += BONUS_FORMACAO_PAREDE
+                    debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+                    val += BONUS_FORMACAO_PAREDE
+                if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+                    bonus += BONUS_PAR_PEDRAS_CONECTADAS
+                    debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+                    val += BONUS_PAR_PEDRAS_CONECTADAS
+                if self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+                    bonus += BONUS_FORMACAO_PONTE
+                    debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+                    val += BONUS_FORMACAO_PONTE
+                l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+                avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+                bonus += avanco
+                debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+                val += avanco
+                centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+                bonus += centro
+                debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+                val += centro
+                l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+                l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+                l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+                seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+                bonus += seg
+                debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+                val += seg
+                pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+                bonus += pen_atrasada
+                debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+                val += pen_atrasada
+                prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+                bonus += prestes
+                debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+                val += prestes
+                borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+                bonus += borda
+                debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+                val += borda
+                if tp == DAMA:
+                    mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+                    mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+                    bonus += mob_dama
+                    debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+                    val += mob_dama
+                ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+                if ameacada_2l:
+                    bonus += PENALIDADE_PECA_AMEACADA_2L
+                    debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+                    val += PENALIDADE_PECA_AMEACADA_2L
+                if self.tem_formacao_ponte(r, c):
+                    bonus += BONUS_FORMACAO_PONTE
+                    debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+                    val += BONUS_FORMACAO_PONTE
+                if self.tem_formacao_lanca(r, c):
+                    bonus += BONUS_FORMACAO_LANCA
+                    debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+                    val += BONUS_FORMACAO_LANCA
+                debug_piece['score_parcial'] = val
+                if debug:
+                    debug_info.append(debug_piece)
+        score = mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        if debug:
             for info in debug_info:
                 print(f"[DEBUG AVAL] Peça {info['tipo']} em {info['pos']}: ")
                 for k, v in info['bônus'].items():
                     print(f"    {k}: {v}")
                 print(f"    Score parcial bônus: {info['score_parcial']}")
-            print(f"[DEBUG AVAL] Score final: {score}\n")
         return score
+
+    def avaliar_heuristica(self, cor_ref: int, debug_aval: bool = False) -> float:
+        allied = self._heuristica_para_cor(cor_ref, debug_aval)
+        opponent = self._heuristica_para_cor(self.get_oponente(cor_ref), False)
+        return allied - opponent
 
     @staticmethod
     def pos_para_alg(p: Posicao)->str: r,c=p; return chr(ord('a')+c)+str(TAMANHO_TABULEIRO-r) if Tabuleiro.is_valido(r,c) else "Inv"
@@ -612,6 +638,31 @@ class Tabuleiro:
                 self.grid[r][c-1] == VAZIO):
                 r_tras = r+1 if cor_peca == BRANCO else r-1
                 if self.is_valido(r_tras, c-1) and Peca.get_cor(self.grid[r_tras][c-1]) == cor_peca:
+                    return True
+        return False
+
+    def tem_formacao_lanca(self, r: int, c: int) -> bool:
+        """
+        Detecta se (r,c) faz parte de uma 'lança' clássica:
+        Duas peças da mesma cor formando um Y com uma casa vazia à frente.
+        Exemplo (para BRANCO):
+        . x .
+        x o x
+        . . .
+        Onde 'o' é a peça avaliada, 'x' são aliadas, '.' são casas vazias.
+        """
+        cor_peca = Peca.get_cor(self.grid[r][c])
+        if cor_peca == VAZIO:
+            return False
+        # Para BRANCO, lança aponta para cima; para PRETO, para baixo
+        direcao = -1 if cor_peca == BRANCO else 1
+        # Checar as duas diagonais à frente
+        for dc in [-1, 1]:
+            r1, c1 = r + direcao, c + dc
+            r2, c2 = r + 2*direcao, c
+            if self.is_valido(r1, c1) and self.is_valido(r2, c2):
+                if (self.grid[r1][c1] != VAZIO and Peca.get_cor(self.grid[r1][c1]) == cor_peca and
+                    self.grid[r2][c2] == VAZIO):
                     return True
         return False
 
@@ -908,6 +959,7 @@ class MotorIA:
         # Quiescência
         if prof <= 0: return self.quiescence_search(tab, MAX_QUIESCENCE_DEPTH, alpha, beta, jog, cor_ia)
         # Movimentos
+        tab.limpar_cache_capturas()  # Limpa o cache de capturas a cada nó
         movs = tab.encontrar_movimentos_possiveis(jog)
         print(f"[minimax]   Nó prof={prof} jogador={jog}: {len(movs)} movimentos gerados")
         if not movs: score_fim = float('-inf') if is_ia else float('inf'); self.transposition_table[hash_pos]=TTEntry(prof, score_fim, TT_FLAG_EXACT, None); return score_fim
