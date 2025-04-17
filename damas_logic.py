@@ -43,6 +43,29 @@ BONUS_FORMACAO_PONTE = 0.3
 BONUS_FORMACAO_LANCA = 0.2
 BONUS_FORMACAO_PAREDE = 0.5
 
+# Tabelas Piece-Square (PSQT)
+PSQT_PEDRA = [
+    [ 0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.00],
+    [ 0.00,  0.05,  0.05,  0.05,  0.05,  0.05,  0.05,  0.00],
+    [ 0.00,  0.05,  0.10,  0.10,  0.10,  0.10,  0.05,  0.00],
+    [ 0.00,  0.05,  0.10,  0.15,  0.15,  0.10,  0.05,  0.00],
+    [ 0.00,  0.05,  0.10,  0.15,  0.15,  0.10,  0.05,  0.00],
+    [ 0.00,  0.05,  0.10,  0.10,  0.10,  0.10,  0.05,  0.00],
+    [ 0.00,  0.05,  0.05,  0.05,  0.05,  0.05,  0.05,  0.00],
+    [ 0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.00,  0.00],
+]
+
+PSQT_DAMA = [
+    [ 0.00,  0.05,  0.05,  0.05,  0.05,  0.05,  0.05,  0.00],
+    [ 0.05,  0.10,  0.10,  0.10,  0.10,  0.10,  0.10,  0.05],
+    [ 0.05,  0.10,  0.15,  0.15,  0.15,  0.15,  0.10,  0.05],
+    [ 0.05,  0.10,  0.15,  0.20,  0.20,  0.15,  0.10,  0.05],
+    [ 0.05,  0.10,  0.15,  0.20,  0.20,  0.15,  0.10,  0.05],
+    [ 0.05,  0.10,  0.15,  0.15,  0.15,  0.15,  0.10,  0.05],
+    [ 0.05,  0.10,  0.10,  0.10,  0.10,  0.10,  0.10,  0.05],
+    [ 0.00,  0.05,  0.05,  0.05,  0.05,  0.05,  0.05,  0.00],
+]
+
 # Regra: Uma dama recém-promovida não pode se mover imediatamente, deve esperar o próximo turno do jogador
 # (após o adversário jogar). Esta regra é implementada utilizando o conjunto damas_recem_promovidas no tabuleiro.
 
@@ -90,7 +113,11 @@ class Tabuleiro:
         self.casas_centro_expandido = {(2,1),(2,3),(2,5),(3,2),(3,4),(4,3),(4,5),(5,2),(5,4),(5,6)}
         self.hash_atual: int = 0
         self.damas_recem_promovidas: Set[Posicao] = set()  # Conjunto para rastrear posições de damas recém-promovidas
+        self._cache_capturas = {}  # Cache local para capturas
         if estado_inicial: self.configuracao_inicial(); self.hash_atual = self.calcular_hash_zobrist_inicial()
+
+    def limpar_cache_capturas(self):
+        self._cache_capturas.clear()
 
     def configuracao_inicial(self):
         for r in range(TAMANHO_TABULEIRO):
@@ -134,7 +161,9 @@ class Tabuleiro:
     def get_posicoes_pecas(self, c: int) -> List[Posicao]: return [(r,col) for r in range(TAMANHO_TABULEIRO) for col in range(TAMANHO_TABULEIRO) if Peca.get_cor(self.grid[r][col])==c]
 
     def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: Movimento, caps_cam: list) -> List[Movimento]:
-        print(f"[RECURSÃO CAPTURA] de {Tabuleiro.pos_para_alg(pos_a)} com caps={caps_cam}")
+        key = (self.hash_atual, pos_a, cor, tipo, tuple(sorted(caps_cam)))
+        if key in self._cache_capturas:
+            return self._cache_capturas[key]
         seqs = []
         op = self.get_oponente(cor)
         dirs = DIRECOES_CAPTURA_PEDRA if tipo == PEDRA else DIRECOES_DAMA
@@ -144,15 +173,8 @@ class Tabuleiro:
                 pd = (pos_a[0] + 2 * dr, pos_a[1] + 2 * dc)
                 l_promo = 0 if cor == BRANCO else TAMANHO_TABULEIRO - 1
                 if self.is_valido(*pd) and Peca.get_cor(self.get_peca(pc)) == op and self.get_peca(pd) == VAZIO and pc not in caps_cam:
-                    # Simula a captura
                     novo_cam = cam_a + [pd]
                     novo_caps = caps_cam + [pc]
-                    # Tenta recursar mesmo após promoção, a menos que a regra obrigue a parar
-                    if pd[0] == l_promo:
-                        print(f"  → interrompe em promoção em {Tabuleiro.pos_para_alg(pd)} (mas tenta recursar)")
-                        # Se a regra exigir parar, descomente a linha abaixo:
-                        # seqs.append(novo_cam)
-                        # continue
                     cont = self._encontrar_capturas_recursivo(pd, cor, tipo, novo_cam, novo_caps)
                     if cont:
                         seqs.extend(cont)
@@ -165,8 +187,6 @@ class Tabuleiro:
                         break
                     peca_i = self.get_peca(pi)
                     if Peca.get_cor(peca_i) == op and pi not in caps_cam:
-                        # percorre TODAS as casas vazias além de pi,
-                        # gerando um movimento para cada pouso possível
                         for j in range(i + 1, TAMANHO_TABULEIRO):
                             pd = (pos_a[0] + j * dr, pos_a[1] + j * dc)
                             if not self.is_valido(*pd):
@@ -179,34 +199,29 @@ class Tabuleiro:
                                     seqs.extend(cont)
                                 else:
                                     seqs.append(novo_cam)
-                        # só interrompe a varredura de i DEPOIS de ter processado todos os pousos (j)
                         break
                     elif peca_i != VAZIO:
                         break
+        self._cache_capturas[key] = seqs
         return seqs
 
     def encontrar_movimentos_possiveis(self, cor: int, apenas_capturas: bool = False) -> List[Movimento]:
         all_capturas = []
         simples = []
         for pos_i in self.get_posicoes_pecas(cor):
-            # Ignorar damas recém-promovidas
             if pos_i in self.damas_recem_promovidas:
                 continue
             pv = self.get_peca(pos_i)
             tipo = Peca.get_tipo(pv)
             caps_peca = self._encontrar_capturas_recursivo(pos_i, cor, tipo, [pos_i], [])
-            # DEBUG: Mostrar info de capturas encontradas
             if caps_peca:
-                print(f"[DEBUG CAPTURAS] cor={cor}, pos={pos_i}, #seqs={len(caps_peca)}")
-                for seq in caps_peca:
-                    print("   →", [Tabuleiro.pos_para_alg(p) for p in seq])
                 all_capturas.extend(caps_peca)
+                pass
         if all_capturas:
             max_caps = max(len(seq)-1 for seq in all_capturas)
             return [seq for seq in all_capturas if len(seq)-1 == max_caps]
         if apenas_capturas:
             return []
-        # Gerar movimentos simples apenas se não houver capturas
         for pos_i in self.get_posicoes_pecas(cor):
             if pos_i in self.damas_recem_promovidas:
                 continue
@@ -229,13 +244,6 @@ class Tabuleiro:
                             simples.append([pos_i, pd])
                         else:
                             break
-        # DEBUG dos movimentos simples
-        if cor == PRETO:
-            movimentos_formatados = [f"{self.pos_para_alg(m[0])}->{self.pos_para_alg(m[1])}" for m in simples]
-            print(f"[DEBUG LOGIC] Mov Simples PRETO: {movimentos_formatados}")
-        elif cor == BRANCO:
-            movimentos_formatados = [f"{self.pos_para_alg(m[0])}->{self.pos_para_alg(m[1])}" for m in simples]
-            print(f"[DEBUG LOGIC] Mov Simples BRANCO: {movimentos_formatados}")
         return simples
 
     def identificar_pecas_capturadas(self, mov: Movimento) -> Dict[Posicao, int]:
@@ -388,8 +396,17 @@ class Tabuleiro:
                     else: md+=1
                     debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp==PEDRA else 'DAMA', 'bônus': {}}
                     val = 0.0
+                    # --- PSQT bonus (pedras e damas) ---
+                    tabela = PSQT_PEDRA if tp == PEDRA else PSQT_DAMA
+                    linha = r if cor_p == BRANCO else (TAMANHO_TABULEIRO-1-r)
+                    mult = VALOR_PEDRA if tp == PEDRA else VALOR_DAMA
+                    bonus_psqt = tabela[linha][c] * mult
+                    bonus_aliado += bonus_psqt
+                    debug_piece['bônus']['PSQT'] = bonus_psqt
+                    val += bonus_psqt
                     vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
                     protegida = self.eh_peca_protegida(r,c)
+                    
                     # Penalidade de vulnerabilidade: só para peças fora da base
                     if vulneravel and not (tp==PEDRA and ((cor_p==BRANCO and r in [0,1]) or (cor_p==PRETO and r in [TAMANHO_TABULEIRO-1,TAMANHO_TABULEIRO-2]))):
                         bonus_aliado += PENALIDADE_PECA_VULNERAVEL
@@ -464,9 +481,14 @@ class Tabuleiro:
                     debug_piece['score_parcial'] = val
                     debug_info.append(debug_piece)
                 else:
+                    # Conta peças do oponente
+                    if tp == PEDRA:
+                        opd += 1
+                    else:
+                        od += 1
                     pass  # Para debug, foque só no lado aliado
         score = (mp*VALOR_PEDRA + md*VALOR_DAMA) - (opd*VALOR_PEDRA + od*VALOR_DAMA)
-        score += (bonus_aliado - bonus_oponente)
+        score += bonus_aliado
         if debug_aval:
             print("[DEBUG AVAL] Score material: {} ({} pedras, {} damas)".format(mp*VALOR_PEDRA + md*VALOR_DAMA, mp, md))
             for info in debug_info:
@@ -908,6 +930,7 @@ class MotorIA:
         # Quiescência
         if prof <= 0: return self.quiescence_search(tab, MAX_QUIESCENCE_DEPTH, alpha, beta, jog, cor_ia)
         # Movimentos
+        tab.limpar_cache_capturas()  # Limpa o cache de capturas a cada nó
         movs = tab.encontrar_movimentos_possiveis(jog)
         print(f"[minimax]   Nó prof={prof} jogador={jog}: {len(movs)} movimentos gerados")
         if not movs: score_fim = float('-inf') if is_ia else float('inf'); self.transposition_table[hash_pos]=TTEntry(prof, score_fim, TT_FLAG_EXACT, None); return score_fim
