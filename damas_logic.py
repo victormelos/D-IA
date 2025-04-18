@@ -1005,7 +1005,7 @@ class MotorIA:
         print("=== Heurística pura (depth=0) para cada root move ===")
         for mov in movimentos_legais:
             estado = tab_copia._fazer_lance(mov, troca_turno=True)
-            val = tab_copia.avaliar_heuristica(cor_ia, debug_aval=True)
+            val = tab_copia.avaliar_heuristica(cor_ia, debug_aval=False)
             tab_copia._desfazer_lance(estado)
             print(f"  {self._formatar_movimento(mov):10} -> {val:.3f}")
         print("=============================================")
@@ -1146,7 +1146,7 @@ class MotorIA:
         entry = self.transposition_table.get(hash_pos)
         if entry and entry.flag == TT_FLAG_EXACT and entry.profundidade >= -1 : self.tt_hits+=1; return entry.score
         self.nos_quiescence_visitados += 1
-        stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=True)
+        stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=False)
         mov_caps = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
         if mov_caps:
             def valor_captura(m):
