@@ -83,7 +83,7 @@ TT_TAMANHO_MB = 128; TT_ENTRIES = (TT_TAMANHO_MB * 1024 * 1024) // 32
 TT_FLAG_EXACT = 0; TT_FLAG_LOWERBOUND = 1; TT_FLAG_UPPERBOUND = 2
 
 # --- Tipos e Estruturas Auxiliares ---
-Posicao = Tuple[int, int]; Movimento = List[Posicao]
+Posicao = Tuple[int, int]; Movimento = Tuple[Posicao, ...]
 class EstadoLanceDesfazer(NamedTuple):
     movimento: Movimento
     peca_movida_original: int
@@ -124,9 +124,14 @@ class Tabuleiro:
         self.hash_atual: int = 0
         self.damas_recem_promovidas: Set[Posicao] = set()  # Conjunto para rastrear posições de damas recém-promovidas
         self._cache_capturas = {}  # Cache local para capturas
+        self.geracao_tabuleiro = 0  # Contador de geração para granularidade do cache
         if estado_inicial: self.configuracao_inicial(); self.hash_atual = self.calcular_hash_zobrist_inicial()
 
     def limpar_cache_capturas(self):
+        """
+        Limpa completamente o cache de capturas. Só deve ser chamado em reset total do tabuleiro.
+        O cache normalmente é indexado por hash_atual, então não precisa ser limpo a cada modificação.
+        """
         self._cache_capturas.clear()
 
     def configuracao_inicial(self):
@@ -162,17 +167,14 @@ class Tabuleiro:
             if pa!=VAZIO: self._atualizar_hash_zobrist(r,c,pa)
             self.grid[r][c]=v
             if v!=VAZIO: self._atualizar_hash_zobrist(r,c,v)
-            self.limpar_cache_capturas()
 
     def mover_peca(self, o: Posicao, d: Posicao):
         p=self.get_peca(o)
         self.set_peca(o, VAZIO)
         self.set_peca(d, p)
-        self.limpar_cache_capturas()
 
     def remover_peca(self, p: Posicao):
         self.set_peca(p, VAZIO)
-        self.limpar_cache_capturas()
 
     @staticmethod
     def is_valido(r: int, c: int) -> bool: return 0<=r<TAMANHO_TABULEIRO and 0<=c<TAMANHO_TABULEIRO
@@ -180,7 +182,7 @@ class Tabuleiro:
     def get_oponente(cor: int) -> int: return PRETO if cor==BRANCO else BRANCO
     def get_posicoes_pecas(self, c: int) -> List[Posicao]: return [(r,col) for r in range(TAMANHO_TABULEIRO) for col in range(TAMANHO_TABULEIRO) if Peca.get_cor(self.grid[r][col])==c]
 
-    def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: Movimento, caps_cam: list, visited=None, depth=0) -> List[Movimento]:
+    def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: tuple, caps_cam: list, visited=None, depth=0) -> List[Movimento]:
         # Monitoramento de profundidade global
         if depth > self.max_depth_reached:
             self.max_depth_reached = depth
@@ -200,7 +202,9 @@ class Tabuleiro:
             return []
         visited = visited | {pos_a}
         use_cache = len(visited) <= 1
-        key = (self.hash_atual, pos_a, cor, tipo, tuple(sorted(caps_cam)), frozenset(visited), frozenset(self.damas_recem_promovidas))
+        # Chave do cache inclui geração do tabuleiro para granularidade e evitar stale hits
+        # Isso garante que qualquer modificação relevante no tabuleiro invalida as entradas antigas do cache
+        key = (self.hash_atual, self.geracao_tabuleiro, pos_a, cor, tipo, tuple(sorted(caps_cam)), frozenset(visited), frozenset(self.damas_recem_promovidas))
         if use_cache and key in self._cache_capturas:
             return self._cache_capturas[key]
         seqs = []
@@ -212,7 +216,7 @@ class Tabuleiro:
                 pd = (pos_a[0] + 2 * dr, pos_a[1] + 2 * dc)
                 l_promo = 0 if cor == BRANCO else TAMANHO_TABULEIRO - 1
                 if self.is_valido(*pd) and Peca.get_cor(self.get_peca(pc)) == op and self.get_peca(pd) == VAZIO and pc not in caps_cam:
-                    novo_cam = cam_a + [pd]
+                    novo_cam = cam_a + (pd,)
                     novo_caps = caps_cam + [pc]
                     cont = self._encontrar_capturas_recursivo(pd, cor, tipo, novo_cam, novo_caps, visited, depth=depth+1)
                     if cont:
@@ -237,7 +241,7 @@ class Tabuleiro:
                                     caminho_livre = False
                                     break
                             if caminho_livre and self.get_peca(pd) == VAZIO:
-                                novo_cam = cam_a + [pd]
+                                novo_cam = cam_a + (pd,)
                                 novo_caps = caps_cam + [pi]
                                 cont = []
                                 for dr2, dc2 in DIRECOES_DAMA:
@@ -253,7 +257,7 @@ class Tabuleiro:
                         break
         if use_cache:
             self._cache_capturas[key] = seqs
-        return seqs
+        return seqs  # Sempre lista de tuplas
 
     def encontrar_movimentos_possiveis(self, cor: int, apenas_capturas: bool = False) -> List[Movimento]:
         all_capturas = []
@@ -265,7 +269,7 @@ class Tabuleiro:
             pv = self.get_peca(pos_i)
             tipo = Peca.get_tipo(pv)
             if pos_i not in capturas_por_pos:
-                capturas_por_pos[pos_i] = self._encontrar_capturas_recursivo(pos_i, cor, tipo, [pos_i], [])
+                capturas_por_pos[pos_i] = self._encontrar_capturas_recursivo(pos_i, cor, tipo, (pos_i,), [])
             caps_peca = capturas_por_pos[pos_i]
             if caps_peca:
                 all_capturas.extend(caps_peca)
@@ -285,7 +289,7 @@ class Tabuleiro:
                 for dr, dc in dirs:
                     pd = (pos_i[0]+dr, pos_i[1]+dc)
                     if self.is_valido(*pd) and self.get_peca(pd) == VAZIO:
-                        simples.append([pos_i, pd])
+                        simples.append((pos_i, pd))  # Já é tupla
             else:
                 for dr, dc in dirs:
                     for i in range(1, TAMANHO_TABULEIRO):
@@ -293,10 +297,10 @@ class Tabuleiro:
                         if not self.is_valido(*pd):
                             break
                         if self.get_peca(pd) == VAZIO:
-                            simples.append([pos_i, pd])
+                            simples.append((pos_i, pd))  # Já é tupla
                         else:
                             break
-        return simples
+        return simples  # Todos já são tuplas
 
     def identificar_pecas_capturadas(self, mov: Movimento) -> Dict[Posicao, int]:
         caps={};
@@ -316,7 +320,7 @@ class Tabuleiro:
         return caps
 
     def _fazer_lance(self, mov: Movimento, troca_turno: bool = True) -> EstadoLanceDesfazer:
-        self.limpar_cache_capturas()
+        # Removido: self.limpar_cache_capturas()
         o=mov[0]; d=mov[-1]; h_a=self.hash_atual; p_o=self.get_peca(o); c=Peca.get_cor(p_o); t_o=Peca.get_tipo(p_o)
         pc=self.identificar_pecas_capturadas(mov); self.mover_peca(o,d);
         for pos_c in pc: self.remover_peca(pos_c)
@@ -331,10 +335,11 @@ class Tabuleiro:
             damas_adicionadas.add(d)
         if troca_turno:
             self._atualizar_hash_turno()
+        self.geracao_tabuleiro += 1  # Invalida cache granularmente
         return EstadoLanceDesfazer(mov,p_o,pc,pr,h_a,damas_adicionadas, troca_turno)
 
     def _desfazer_lance(self, e: EstadoLanceDesfazer):
-        self.limpar_cache_capturas()
+        # Removido: self.limpar_cache_capturas()
         self.hash_atual=e.hash_anterior; mov=e.movimento; o=mov[0]; d=mov[-1]; p_r=e.peca_movida_original
         self.grid[d[0]][d[1]]=VAZIO; self.grid[o[0]][o[1]]=p_r;
         for pos_c,val_c in e.pecas_capturadas.items(): self.grid[pos_c[0]][pos_c[1]] = val_c
@@ -344,6 +349,7 @@ class Tabuleiro:
                 self.damas_recem_promovidas.remove(pos)
         if e.troca_turno:
             self._atualizar_hash_turno()
+        self.geracao_tabuleiro += 1  # Invalida cache granularmente
 
     def calcular_mobilidade_futura(self, r: int, c: int, cor: int, tipo: int) -> int:
         """
@@ -432,12 +438,13 @@ class Tabuleiro:
         # Consideramos uma parede quando há pelo menos 3 peças conectadas
         return conta_conectadas >= 3
 
-    def _heuristica_para_cor(self, cor_ref: int, debug: bool = False) -> float:
+    def _heuristica_para_cor(self, cor_ref: int, completo: bool = True, debug: bool = False) -> float:
         mp, md = 0, 0
         bonus = 0.0
         debug_info = []
         bordas = [(0, 1), (0, 3), (0, 5), (0, 7), (1, 0), (2, 7), (3, 0), (4, 7), (5, 0), (6, 7), (7, 0), (7, 2), (7, 4), (7, 6)]
         cache_vulneravel = {}
+        total_val = 0.0
         for r in range(TAMANHO_TABULEIRO):
             for c in range(TAMANHO_TABULEIRO):
                 p = self.grid[r][c]
@@ -452,8 +459,6 @@ class Tabuleiro:
                     mp += 1
                 else:
                     md += 1
-                debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
-                val = 0.0
                 tabela = PSQT_PEDRA if tp == PEDRA else PSQT_DAMA
                 if cor_ref == BRANCO:
                     linha = r
@@ -462,8 +467,10 @@ class Tabuleiro:
                 mult = VALOR_PEDRA if tp == PEDRA else VALOR_DAMA
                 bonus_psqt = tabela[linha][c] * mult * 0.7  # reduz impacto do PSQT em 30%
                 bonus += bonus_psqt
-                debug_piece['bônus']['PSQT'] = bonus_psqt
-                val += bonus_psqt
+                if not completo:
+                    continue
+                debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+                val = 0.0
                 vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
                 protegida = self.eh_peca_protegida(r, c)
                 if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
@@ -546,32 +553,2308 @@ class Tabuleiro:
                 debug_piece['score_parcial'] = val
                 if debug:
                     debug_info.append(debug_piece)
-        # ---- penaliza movimentos que deixam captura imediata ----
-        tab_temp = self.criar_copia()
-        cor_op = Tabuleiro.get_oponente(cor_ref)
-        caps = tab_temp.encontrar_movimentos_possiveis(cor_op, apenas_capturas=True)
-        valor_caps = sum(VALOR_DAMA if abs(self.get_peca(m[0]))==DAMA else VALOR_PEDRA for m in caps)
-        if valor_caps > 0:
-            bonus += -valor_caps
-            if debug:
-                debug_info.append({
-                    'pos': None, 'tipo':'PÊNALTI TÁTICO',
-                    'bônus':{'PENALIDADE_CAPTURA_IMEDIATA': -valor_caps},
-                    'score_parcial': -valor_caps
-                })
-        # só depois é que fecha o score
-        score = mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+                total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
         if debug:
-            for info in debug_info:
-                print(f"[DEBUG AVAL] Peça {info['tipo']} em {info['pos']}: ")
-                for k, v in info['bônus'].items():
-                    print(f"    {k}: {v}")
-                print(f"    Score parcial bônus: {info['score_parcial']}")
-        return score
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        if vulneravel and not (tp == PEDRA and ((cor_p == BRANCO and r in [0, 1]) or (cor_p == PRETO and r in [TAMANHO_TABULEIRO-1, TAMANHO_TABULEIRO-2]))):
+            bonus += PENALIDADE_PECA_VULNERAVEL
+            debug_piece['bônus']['PENALIDADE_PECA_VULNERAVEL'] = PENALIDADE_PECA_VULNERAVEL
+            val += PENALIDADE_PECA_VULNERAVEL
+        if protegida:
+            bonus += BONUS_PECA_PROTEGIDA
+            debug_piece['bônus']['BONUS_PECA_PROTEGIDA'] = BONUS_PECA_PROTEGIDA
+            val += BONUS_PECA_PROTEGIDA
+        mov_fut = self.calcular_mobilidade_futura(r, c, cor_p, tp)
+        if mov_fut > 0:
+            bonus += mov_fut * BONUS_MOBILIDADE_FUTURA
+            debug_piece['bônus']['BONUS_MOBILIDADE_FUTURA'] = mov_fut * BONUS_MOBILIDADE_FUTURA
+            val += mov_fut * BONUS_MOBILIDADE_FUTURA
+        if self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_BLOQUEIO_AVANCO
+            debug_piece['bônus']['BONUS_BLOQUEIO_AVANCO'] = BONUS_BLOQUEIO_AVANCO
+            val += BONUS_BLOQUEIO_AVANCO
+        if self.detectar_formacao_parede(r, c, cor_p) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_FORMACAO_PAREDE
+            debug_piece['bônus']['BONUS_FORMACAO_PAREDE'] = BONUS_FORMACAO_PAREDE
+            val += BONUS_FORMACAO_PAREDE
+        if self.tem_pedras_conectadas(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p):
+            bonus += BONUS_PAR_PEDRAS_CONECTADAS
+            debug_piece['bônus']['BONUS_PAR_PEDRAS_CONECTADAS'] = BONUS_PAR_PEDRAS_CONECTADAS
+            val += BONUS_PAR_PEDRAS_CONECTADAS
+        ponte_bloqueio = self.tem_formacao_ponte(r, c) and self.detectar_bloqueio_avanco(r, c, cor_p)
+        if ponte_bloqueio:
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        l_av = r if cor_p == PRETO else (TAMANHO_TABULEIRO-1 - r)
+        avanco = l_av * BONUS_AVANCO_PEDRA if tp == PEDRA else 0
+        bonus += avanco
+        debug_piece['bônus']['BONUS_AVANCO_PEDRA'] = avanco
+        val += avanco
+        centro = (BONUS_CONTROLE_CENTRO_DAMA if tp == DAMA else BONUS_CONTROLE_CENTRO_PEDRA) if pos in self.casas_centro_expandido else 0
+        bonus += centro
+        debug_piece['bônus']['BONUS_CONTROLE_CENTRO'] = centro
+        val += centro
+        l_seg_propria = 0 if cor_p == BRANCO else TAMANHO_TABULEIRO - 1
+        l_base_propria = {0, 1} if cor_p == BRANCO else {TAMANHO_TABULEIRO - 1, TAMANHO_TABULEIRO - 2}
+        l_promo_iminente = 1 if cor_p == BRANCO else TAMANHO_TABULEIRO - 2
+        seg = BONUS_SEGURANCA_ULTIMA_LINHA if r == l_seg_propria else 0
+        bonus += seg
+        debug_piece['bônus']['BONUS_SEGURANCA_ULTIMA_LINHA'] = seg
+        val += seg
+        pen_atrasada = PENALIDADE_PEDRA_ATRASADA if tp == PEDRA and r in l_base_propria else 0
+        bonus += pen_atrasada
+        debug_piece['bônus']['PENALIDADE_PEDRA_ATRASADA'] = pen_atrasada
+        val += pen_atrasada
+        prestes = BONUS_PRESTES_PROMOVER if tp == PEDRA and r == l_promo_iminente and not vulneravel else 0
+        bonus += prestes
+        debug_piece['bônus']['BONUS_PRESTES_PROMOVER'] = prestes
+        val += prestes
+        borda = BONUS_PECA_NA_BORDA if tp == DAMA and pos in bordas else 0.0
+        bonus += borda
+        debug_piece['bônus']['BONUS_PECA_NA_BORDA'] = borda
+        val += borda
+        if tp == DAMA:
+            mobilidade = sum(1 for dr, dc in DIRECOES_DAMA if self.is_valido(r + dr, c + dc) and self.get_peca((r + dr, c + dc)) == VAZIO)
+            mob_dama = mobilidade * BONUS_MOBILIDADE_DAMA if mobilidade > 0 else 0
+            bonus += mob_dama
+            debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
+            val += mob_dama
+        ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+        if ameacada_2l:
+            bonus += PENALIDADE_PECA_AMEACADA_2L
+            debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+            val += PENALIDADE_PECA_AMEACADA_2L
+        if self.tem_formacao_ponte(r, c):
+            bonus += BONUS_FORMACAO_PONTE
+            debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
+            val += BONUS_FORMACAO_PONTE
+        if self.tem_formacao_lanca(r, c):
+            bonus += BONUS_FORMACAO_LANCA
+            debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
+            val += BONUS_FORMACAO_LANCA
+        debug_piece['score_parcial'] = val
+        if debug:
+            debug_info.append(debug_piece)
+        total_val += val
+        if not completo:
+            # Avaliação reduzida: só material + PSQT
+            return mp * VALOR_PEDRA + md * VALOR_DAMA + bonus
+        debug_piece = {'pos': pos, 'tipo': 'PEDRA' if tp == PEDRA else 'DAMA', 'bônus': {}}
+        val = 0.0
+        vulneravel = self.eh_peca_vulneravel(r, c, cache_vulneravel)
+        protegida = self.eh_peca_protegida(r, c)
+        return val
 
-    def avaliar_heuristica(self, cor_ref: int, debug_aval: bool = False) -> float:
-        allied = self._heuristica_para_cor(cor_ref, debug_aval)
-        opponent = self._heuristica_para_cor(self.get_oponente(cor_ref), False)
+    def avaliar_heuristica(self, cor_ref: int, completo: bool = True, debug_aval: bool = False) -> float:
+        # Avaliação completa (com ameaças profundas) se completo=True, leve se completo=False
+        allied = self._heuristica_para_cor(cor_ref, completo=completo, debug=debug_aval)
+        opponent = self._heuristica_para_cor(self.get_oponente(cor_ref), completo=completo, debug=False)
         return allied - opponent
 
     @staticmethod
@@ -580,7 +2863,7 @@ class Tabuleiro:
     def alg_para_pos(alg: str)->Optional[Posicao]: alg=alg.lower().strip(); return (lambda c,l: (l,c) if Tabuleiro.is_valido(l,c) else None)(ord(alg[0])-ord('a'), TAMANHO_TABULEIRO-int(alg[1])) if len(alg)==2 and 'a'<=alg[0]<='h' and '1'<=alg[1]<='8' else None
 
     def criar_copia(self) -> 'Tabuleiro':
-        """Cria uma cópia profunda do tabuleiro atual."""
+        """Cria uma cópia profunda do tabuleiro atual. NÃO USAR NA BUSCA, apenas para interface externa/debug."""
         nova_copia = Tabuleiro(estado_inicial=False)  # Cria um tabuleiro vazio
         nova_copia.grid = [linha[:] for linha in self.grid]  # Copia profunda da grade
         nova_copia.hash_atual = self.hash_atual
@@ -591,6 +2874,7 @@ class Tabuleiro:
         """
         Remove as damas recém-promovidas de uma cor específica da lista de controle.
         Chamado quando termina o turno do jogador oponente.
+        ATENÇÃO: Não deve alterar o hash_atual! O hash de promoção é tratado apenas em _fazer_lance/_desfazer_lance.
         """
         # Para cada posição no conjunto de damas recém-promovidas
         damas_para_remover = []
@@ -599,10 +2883,9 @@ class Tabuleiro:
             # Verificar se a peça pertence à cor especificada
             if Peca.get_cor(peca) == cor:
                 damas_para_remover.append(pos)
-        
         # Remover as damas da cor especificada
         for pos in damas_para_remover:
-            self.hash_atual ^= Z_PROM[pos[0]][pos[1]]
+            # Removido: self.hash_atual ^= Z_PROM[pos[0]][pos[1]]
             self.damas_recem_promovidas.remove(pos)
 
     def eh_peca_vulneravel(self, r: int, c: int, cache_vulneravel: dict = None) -> bool:
@@ -740,6 +3023,7 @@ class Tabuleiro:
         """
         Retorna True se a peça em (r, c) pode ser capturada em até 2 lances do adversário,
         considerando que o próprio jogador pode responder entre os lances do oponente.
+        Implementação incremental: não usa criar_copia, apenas _fazer_lance/_desfazer_lance.
         """
         cor_peca = Peca.get_cor(self.grid[r][c])
         if cor_peca == VAZIO:
@@ -747,17 +3031,21 @@ class Tabuleiro:
         cor_oponente = self.get_oponente(cor_peca)
         # 1º lance: para cada movimento do oponente
         for mov1 in self.encontrar_movimentos_possiveis(cor_oponente):
-            tab_temp1 = self.criar_copia()
-            tab_temp1._fazer_lance(mov1, troca_turno=True)
-            # 2º lance: para cada resposta do próprio jogador
-            for mov_resp in tab_temp1.encontrar_movimentos_possiveis(cor_peca):
-                tab_temp2 = tab_temp1.criar_copia()
-                tab_temp2._fazer_lance(mov_resp, troca_turno=True)
-                # Agora, o oponente tenta capturar em 2 lances
-                for mov2 in tab_temp2.encontrar_movimentos_possiveis(cor_oponente):
-                    capturas2 = tab_temp2.identificar_pecas_capturadas(mov2)
-                    if (r, c) in capturas2:
-                        return True
+            estado1 = self._fazer_lance(mov1, troca_turno=True)
+            try:
+                # 2º lance: para cada resposta do próprio jogador
+                for mov_resp in self.encontrar_movimentos_possiveis(cor_peca):
+                    estado2 = self._fazer_lance(mov_resp, troca_turno=True)
+                    try:
+                        # Agora, o oponente tenta capturar em 2 lances
+                        for mov2 in self.encontrar_movimentos_possiveis(cor_oponente):
+                            capturas2 = self.identificar_pecas_capturadas(mov2)
+                            if (r, c) in capturas2:
+                                return True
+                    finally:
+                        self._desfazer_lance(estado2)
+            finally:
+                self._desfazer_lance(estado1)
         return False
 
     def material_balance(self, cor_ref: int) -> float:
@@ -853,7 +3141,7 @@ class Partida:
             pos_final = movimento[-1]
             peca_final = self.tabuleiro.get_peca(pos_final)
             tipo_final = Peca.get_tipo(peca_final)
-            capturas_combo = self.tabuleiro._encontrar_capturas_recursivo(pos_final, self.jogador_atual, tipo_final, [pos_final], [])
+            capturas_combo = self.tabuleiro._encontrar_capturas_recursivo(pos_final, self.jogador_atual, tipo_final, (pos_final,), [])
             if capturas_combo:
                 # Combo: não troca turno nem hash
                 self.movimentos_legais_atuais = [c for c in capturas_combo if len(c) > 1]
@@ -878,7 +3166,7 @@ class Partida:
         copia.contador_lances_sem_progresso = self.contador_lances_sem_progresso
         copia.total_lances = self.total_lances
         copia.vencedor = self.vencedor
-        copia.movimentos_legais_atuais = [movimento[:] for movimento in self.movimentos_legais_atuais]
+        copia.movimentos_legais_atuais = [tuple(movimento) for movimento in self.movimentos_legais_atuais]
         return copia
 
 # --- Classe MotorIA (Versão com Iterative Deepening + Time Management) ---
@@ -892,8 +3180,8 @@ class MotorIA:
         self.nos_visitados = 0; self.nos_quiescence_visitados = 0; self.tt_hits = 0
         self.null_cuts = 0; self.null_attempts = 0
         self.lmr_attempts = 0; self.lmr_recalls = 0
-        # Transposition table, killers, history
-        self.transposition_table: OrderedDict[int,TTEntry] = OrderedDict()
+        # Transposition table agora é um dict puro para máxima performance (ordenação não é necessária)
+        self.transposition_table: dict[int,TTEntry] = {}
         self.killer_moves = [[None,None] for _ in range(profundidade+1)]
         self.history_heuristic = defaultdict(int)
         self.MULTICUT_N = 4
@@ -910,12 +3198,15 @@ class MotorIA:
         # Monitoramento de profundidade global
         self.max_depth_reached = 0
         self._depth_warning_emitted = False
+        # Cache de ordenação de movimentos por hash_atual
+        self.ordenacao_cache: Dict[int, List[Movimento]] = {}
 
     def limpar_tt_e_historico(self):
         self.transposition_table.clear(); self.killer_moves = [[None,None] for _ in range(self.profundidade_maxima+1)]
         self.history_heuristic.clear(); self.null_cuts = 0; self.null_attempts = 0
         self.lmr_attempts = 0; self.lmr_recalls = 0
         self.tempo_acabou = False
+        self.ordenacao_cache.clear()  # Limpa o cache de ordenação junto com a TT
 
     def _formatar_movimento(self, mov: Movimento) -> str: return " -> ".join([Tabuleiro.pos_para_alg(p) for p in mov]) if mov else "N/A"
     def _mov_para_chave_history(self, mov: Movimento) -> Optional[Tuple[Posicao, Posicao]]: return (mov[0], mov[-1]) if mov and len(mov) >= 2 else None
@@ -1004,15 +3295,24 @@ class MotorIA:
                 resultados_por_profundidade[prof_atual] = movs_avaliados
                 self.melhor_movimento_atual = melhor_mov_prof
 
-                # Aspiration fail: relança com janela ampla
-                if melhor_score_prof <= alpha_asp or melhor_score_prof >= beta_asp:
-                    print(f"[IA] Aspiration fail na prof {prof_atual} (score={melhor_score_prof:.2f} fora de [{alpha_asp:.2f},{beta_asp:.2f}]), relançando com janela ampla")
+                # Aspiration fail: expanda a janela progressivamente
+                fail_count = 0
+                delta_expand = self.aspiration_delta
+                alpha_exp, beta_exp = alpha_asp, beta_asp
+                while melhor_score_prof <= alpha_exp or melhor_score_prof >= beta_exp:
+                    fail_count += 1
+                    if melhor_score_prof <= alpha_exp:
+                        alpha_exp -= delta_expand
+                    if melhor_score_prof >= beta_exp:
+                        beta_exp += delta_expand
+                    print(f"[IA] Aspiration fail na prof {prof_atual} (score={melhor_score_prof:.2f} fora de [{alpha_exp:.2f},{beta_exp:.2f}]), relançando com janela expandida (delta={delta_expand})")
                     melhor_score_prof, melhor_mov_prof, movs_avaliados = self._search_root(
-                        tab_copia, prof_atual, -float('inf'), float('inf'), movs_ord_raiz, cor_ia, cache_capturas_oponente)
+                        tab_copia, prof_atual, alpha_exp, beta_exp, movs_ord_raiz, cor_ia, cache_capturas_oponente)
                     resultados_por_profundidade[prof_atual] = movs_avaliados
                     self.melhor_movimento_atual = melhor_mov_prof
-
-                # Ajuste dinâmico do aspiration_delta com base na dispersão dos scores
+                    # Expande delta progressivamente (pode ser multiplicativo ou aditivo)
+                    delta_expand *= 2
+                # Ajuste dinâmico do aspiration_delta com base na dispersão dos scores e no número de fails
                 scores = list(movs_avaliados.values())
                 if len(scores) > 1:
                     m = sum(scores) / len(scores)
@@ -1072,7 +3372,7 @@ class MotorIA:
         print("=== Heurística pura (depth=0) para cada root move ===")
         for mov in movimentos_legais:
             estado = tab_copia._fazer_lance(mov, troca_turno=True)
-            val = tab_copia.avaliar_heuristica(cor_ia, debug_aval=False)
+            val = tab_copia.avaliar_heuristica(cor_ia, completo=True, debug_aval=False)
             tab_copia._desfazer_lance(estado)
             print(f"  {self._formatar_movimento(mov):10} -> {val:.3f}")
         print("=============================================")
@@ -1081,7 +3381,7 @@ class MotorIA:
         if self.debug_heur:
             print("\n=== DEBUG HEURÍSTICO DO TABULEIRO ATUAL ===")
             mat = partida.tabuleiro.material_balance(cor_ia)
-            stat = partida.tabuleiro.avaliar_heuristica(cor_ia, debug_aval=True)
+            stat = partida.tabuleiro.avaliar_heuristica(cor_ia, completo=True, debug_aval=True)
             print(f"Material balance: {mat:.2f}")
             print(f"Static eval   : {stat:.2f}")
             print(f"Heur extra    : {stat - mat:.2f}  (tudo o que não é só material)\n")
@@ -1114,42 +3414,48 @@ class MotorIA:
             tab._atualizar_hash_turno()
             if score >= beta:
                 self.null_cuts += 1
+                self.podas_beta += 1
                 return beta
 
-        movs = tab.encontrar_movimentos_possiveis(jog)
-        # Futility pruning: só em prof == 1, sem forcing moves, margem dinâmica
-        if prof == 1:
-            has_forcing_moves = any(len(tab.identificar_pecas_capturadas(m)) > 0 for m in movs)
-            if not has_forcing_moves:
-                margin = self.futility_margin(prof)
-                static = tab.avaliar_heuristica(cor_ia)
-                movs = [m for m in movs if len(tab.identificar_pecas_capturadas(m)) > 0 or static + margin > alpha]
-
-        # Ordenação: TT, killer, captures, history
-        movs_ordenados = []
-        melhor_mov_tt = None
-        entry = self.transposition_table.get(tab.hash_atual)
-        if entry and entry.melhor_movimento and entry.melhor_movimento in movs:
-            melhor_mov_tt = entry.melhor_movimento
-            movs_ordenados.append(melhor_mov_tt)
-            movs.remove(melhor_mov_tt)
+        # --- Ordenação de movimentos com cache por hash_atual ---
+        hash_pos = tab.hash_atual
         kd = self.profundidade_maxima - prof
-        killer_list = []
-        if kd >= 0 and kd < len(self.killer_moves):
-            for kmov in self.killer_moves[kd]:
-                if kmov is not None and kmov in movs:
-                    killer_list.append(kmov)
-                    movs.remove(kmov)
-        movs_ordenados.extend(killer_list)
-        mov_caps = [m for m in movs if len(tab.identificar_pecas_capturadas(m)) > 0]
-        mov_caps.sort(key=lambda m: sum(abs(v) for v in tab.identificar_pecas_capturadas(m).values()), reverse=True)
-        mov_nao_caps = [m for m in movs if m not in mov_caps]
-        mov_nao_caps.sort(key=lambda m: self.history_heuristic.get((m[0], m[-1]), 0), reverse=True)
-        movs_ordenados.extend(mov_caps)
-        movs_ordenados.extend(mov_nao_caps)
-
+        if hash_pos in self.ordenacao_cache:
+            movs_ordenados = self.ordenacao_cache[hash_pos][:]
+        else:
+            movs = tab.encontrar_movimentos_possiveis(jog)
+            # Futility pruning: só em prof == 1, sem forcing moves, margem dinâmica
+            if prof == 1:
+                has_forcing_moves = any(len(tab.identificar_pecas_capturadas(m)) > 0 for m in movs)
+                if not has_forcing_moves:
+                    margin = self.futility_margin(prof)
+                    static = tab.avaliar_heuristica(cor_ia, completo=True)
+                    movs = [m for m in movs if len(tab.identificar_pecas_capturadas(m)) > 0 or static + margin > alpha]
+            # Pocket move (PV-move) do TT
+            movs_ordenados = []
+            entry = self.transposition_table.get(hash_pos)
+            if entry and entry.melhor_movimento and entry.melhor_movimento in movs:
+                movs_ordenados.append(entry.melhor_movimento)
+                movs.remove(entry.melhor_movimento)
+            # Killers
+            kd = self.profundidade_maxima - prof
+            killer_list = []
+            if kd >= 0 and kd < len(self.killer_moves):
+                for kmov in self.killer_moves[kd]:
+                    if kmov is not None and kmov in movs:
+                        killer_list.append(kmov)
+                        movs.remove(kmov)
+            movs_ordenados.extend(killer_list)
+            # Capturas
+            mov_caps = [m for m in movs if len(tab.identificar_pecas_capturadas(m)) > 0]
+            mov_caps.sort(key=lambda m: sum(abs(v) for v in tab.identificar_pecas_capturadas(m).values()), reverse=True)
+            mov_nao_caps = [m for m in movs if m not in mov_caps]
+            mov_nao_caps.sort(key=lambda m: self.history_heuristic.get((m[0], m[-1]), 0), reverse=True)
+            movs_ordenados.extend(mov_caps)
+            movs_ordenados.extend(mov_nao_caps)
+            # Salva no cache
+            self.ordenacao_cache[hash_pos] = movs_ordenados[:]
         # --- Multi-Cut Pruning (usando helper) ---
-        # Ajuste dinâmico dos parâmetros
         N = min(self.MULTICUT_N, max(2, len(movs_ordenados)//3))
         K = min(self.MULTICUT_K, N)
         R = 2 if prof < 8 else 3
@@ -1168,6 +3474,7 @@ class MotorIA:
                     beta_cut_count += 1
                     if beta_cut_count >= K:
                         self.multicuts_cut += 1
+                        self.podas_beta += 1
                         return beta
 
         melhor_val = -float('inf'); a_orig = alpha
@@ -1179,14 +3486,14 @@ class MotorIA:
             if i % 8 == 0 and self.verificar_tempo():
                 raise TempoExcedidoError("Tempo excedido durante minimax")
             is_capture = len(tab.identificar_pecas_capturadas(mov)) > 0
-            static_eval = tab.avaliar_heuristica(cor_ia)
+            static_eval = tab.avaliar_heuristica(cor_ia, completo=True)
             # --- Principal Variation Search (PVS) ---
             if i == 0:
                 # PV move: busca full-window
                 score = -self.minimax(tab, cont_emp, prof-1, -beta, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
             else:
                 # LMR só em não-PV, não-captura, heurística fria
-                do_lmr = self.lmr_reduction(prof, i) > 0 and not is_capture and static_eval + LMR_MARGIN <= alpha
+                do_lmr = self.usar_lmr and self.lmr_reduction(prof, i) > 0 and not is_capture and static_eval + LMR_MARGIN <= alpha
                 if do_lmr:
                     self.lmr_attempts += 1
                     R_lmr = self.lmr_reduction(prof, i)
@@ -1216,6 +3523,7 @@ class MotorIA:
                     if mov not in self.killer_moves[kd]:
                         self.killer_moves[kd][1] = self.killer_moves[kd][0]
                         self.killer_moves[kd][0] = mov
+                self.podas_beta += 1
                 break
 
         # Preencher a transposition table (TT)
@@ -1250,33 +3558,33 @@ class MotorIA:
         entry = self.transposition_table.get(hash_pos)
         if entry and entry.flag == TT_FLAG_EXACT and entry.profundidade >= -1 : self.tt_hits+=1; return entry.score
         self.nos_quiescence_visitados += 1
-        stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=False)
+        # Avaliação leve (completo=False) para stand_pat e intermediários
+        stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=False, completo=False)
         mov_caps = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
-        # SEE completo para cortes
-        def see_gain(tab, mov, jog_q):
-            pos = mov[-1]
-            return self.see(tab, pos, jog_q)
+        # Delta-pruning: corta cedo se nenhuma captura pode melhorar alpha
+        def valor_captura(m):
+            capturadas = tab.identificar_pecas_capturadas(m)
+            if not capturadas:
+                return 0
+            atacante = tab.get_peca(m[0])
+            tipo_atacante = abs(atacante)
+            valor = 0
+            for v in capturadas.values():
+                tipo_capturado = abs(v)
+                if tipo_capturado == DAMA and tipo_atacante == PEDRA:
+                    valor += VALOR_DAMA + 10  # Pedra captura dama: ótimo
+                elif tipo_capturado == DAMA and tipo_atacante == DAMA:
+                    valor += VALOR_DAMA
+                elif tipo_capturado == PEDRA:
+                    valor += VALOR_PEDRA
+            return valor
         if mov_caps:
-            def valor_captura(m):
-                capturadas = tab.identificar_pecas_capturadas(m)
-                if not capturadas:
-                    return 0
-                atacante = tab.get_peca(m[0])
-                tipo_atacante = abs(atacante)
-                valor = 0
-                for v in capturadas.values():
-                    tipo_capturado = abs(v)
-                    if tipo_capturado == DAMA and tipo_atacante == PEDRA:
-                        valor += VALOR_DAMA + 10  # Pedra captura dama: ótimo
-                    elif tipo_capturado == DAMA and tipo_atacante == DAMA:
-                        valor += VALOR_DAMA
-                    elif tipo_capturado == PEDRA:
-                        valor += VALOR_PEDRA
-                return valor
             max_gain = max(valor_captura(m) for m in mov_caps)
             if stand_pat + max_gain <= a:
                 return stand_pat
-        if prof_q <= 0: return stand_pat
+        if prof_q <= 0:
+            # Node folha da quiescência: avaliação completa
+            return tab.avaliar_heuristica(cor_ia, completo=True, debug_aval=False)
         is_max = (jog_q == cor_ia)
         if is_max: a = max(a, stand_pat)
         else: b = min(b, stand_pat)
@@ -1285,8 +3593,8 @@ class MotorIA:
         score_final_q = stand_pat
         if is_max:
             for mov in mov_caps:
-                # SEE pruning completo
-                if see_gain(tab, mov, jog_q) + stand_pat <= a:
+                # SEE reduzido: só considera a troca inicial
+                if self.see(tab, mov[-1], jog_q) + stand_pat <= a:
                     continue
                 cp=bool(tab.identificar_pecas_capturadas(mov))
                 pos_final = mov[-1]
@@ -1307,8 +3615,8 @@ class MotorIA:
                 if b <= a: break
         else:
             for mov in mov_caps:
-                # SEE pruning completo
-                if see_gain(tab, mov, jog_q) + stand_pat <= a:
+                # SEE reduzido: só considera a troca inicial
+                if self.see(tab, mov[-1], jog_q) + stand_pat <= a:
                     continue
                 cp=bool(tab.identificar_pecas_capturadas(mov))
                 pos_final = mov[-1]
@@ -1352,7 +3660,7 @@ class MotorIA:
             pos_final = mov[-1]
             peca_final = tab.get_peca(pos_final)
             tipo_final = Peca.get_tipo(peca_final)
-            capturas_combo = tab._encontrar_capturas_recursivo(pos_final, cor_ia, tipo_final, [pos_final], []) if cp else []
+            capturas_combo = tab._encontrar_capturas_recursivo(pos_final, cor_ia, tipo_final, (pos_final,), []) if cp else []
             troca_turno = not (cp and capturas_combo)
             estado_d = tab._fazer_lance(mov, troca_turno=troca_turno)
             try:
@@ -1421,13 +3729,11 @@ class MotorIA:
 
     def see(self, tab, pos, atacante_cor):
         """
-        Static Exchange Evaluation completo: simula trocas recíprocas em 'pos', alternando os lados,
-        sempre usando o atacante mais barato disponível de cada lado.
+        Static Exchange Evaluation reduzido: só considera a troca inicial (profundidade 1).
         Retorna o ganho líquido estimado para o lado que inicia (atacante_cor).
         """
         # Função auxiliar para obter todos os atacantes de uma casa
-        def get_all_attackers(tab, pos, cor):
-            atacantes = []
+        def get_first_attacker(tab, pos, cor):
             for r in range(TAMANHO_TABULEIRO):
                 for c in range(TAMANHO_TABULEIRO):
                     peca = tab.grid[r][c]
@@ -1435,47 +3741,21 @@ class MotorIA:
                         movs = tab.encontrar_movimentos_possiveis(cor, apenas_capturas=True)
                         for mov in movs:
                             if mov[-1] == pos:
-                                atacantes.append((r, c))
-            return atacantes
+                                return (r, c)
+            return None
         # Função auxiliar para valor da peça
         def piece_value(v):
             return VALOR_DAMA if abs(v) == DAMA else VALOR_PEDRA
-        # Função auxiliar para cor da peça
-        def piece_color(v):
-            return Peca.get_cor(v)
-        # Inicializa
-        tab_copia = tab.criar_copia()
-        gain = []
-        side = atacante_cor
-        ocupante = tab_copia.get_peca(pos)
+        ocupante = tab.get_peca(pos)
         if ocupante == VAZIO:
             return 0
-        gain.append(piece_value(ocupante))
-        atacantes = {BRANCO: get_all_attackers(tab_copia, pos, BRANCO), PRETO: get_all_attackers(tab_copia, pos, PRETO)}
-        idx = 0
-        while True:
-            # Remove o atacante mais barato do lado atual
-            candidatos = atacantes[side]
-            if not candidatos:
-                break
-            # Escolhe o atacante mais barato
-            candidatos.sort(key=lambda p: piece_value(tab_copia.get_peca(p)))
-            attacker = candidatos[0]
-            # Remove atacante do tabuleiro
-            tab_copia.set_peca(attacker, VAZIO)
-            atacantes[side].remove(attacker)
-            # Remove peça capturada em pos
-            tab_copia.set_peca(pos, VAZIO)
-            # Alterna lado
-            side = Tabuleiro.get_oponente(side)
-            # Atualiza atacantes do novo lado
-            atacantes[side] = get_all_attackers(tab_copia, pos, side)
-            # Se houver novo atacante, adiciona valor ao ganho
-            if atacantes[side]:
-                next_attacker = min(atacantes[side], key=lambda p: piece_value(tab_copia.get_peca(p)))
-                gain.append((-1)**(idx+1) * piece_value(tab_copia.get_peca(next_attacker)))
-            idx += 1
-        return sum(gain)
+        # Primeiro atacante do lado atual
+        attacker_pos = get_first_attacker(tab, pos, atacante_cor)
+        if not attacker_pos:
+            return 0
+        atacante = tab.get_peca(attacker_pos)
+        ganho = piece_value(ocupante) - piece_value(atacante)
+        return ganho
 
 # --- Bloco Principal (Teste) ---
 if __name__ == "__main__":
