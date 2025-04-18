@@ -955,6 +955,7 @@ class MotorIA:
                 break
 
             # --- Aspiration Windows ---
+            # Para profundidade 1, sempre janela total; só usa aspiration a partir de 2
             if prof_atual == 1:
                 alpha, beta = -float('inf'), float('inf')
             else:
@@ -1019,6 +1020,7 @@ class MotorIA:
                     stddev = math.sqrt(var)
                     self.aspiration_delta = max(2.0, min(30.0, stddev * 2.5))
                 else:
+                    # sem variação ou sem scores, manter delta padrão
                     self.aspiration_delta = 15.0
 
                 # Atualiza melhor_score_prev para próxima profundidade
@@ -1156,12 +1158,12 @@ class MotorIA:
             beta_cut_count = 0
             multicut_cache = {}
             for mov in movs_ordenados[:N]:
-                # Cache local: evita reexplorar o mesmo nó
-                if mov in multicut_cache:
-                    score = multicut_cache[mov]
+                key = tuple(mov)  # usa tupla, que é hashable
+                if key in multicut_cache:
+                    score = multicut_cache[key]
                 else:
                     score = -self.minimax(tab, cont_emp, prof-R, -beta, -beta+1, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
-                    multicut_cache[mov] = score
+                    multicut_cache[key] = score
                 if score >= beta:
                     beta_cut_count += 1
                     if beta_cut_count >= K:
@@ -1361,8 +1363,9 @@ class MotorIA:
                 else:
                     capturas_oponente = tab.encontrar_movimentos_possiveis(cor_op, apenas_capturas=True)
                     cache_capturas_oponente[hash_apos] = capturas_oponente
-                if capturas_oponente:
-                    continue
+                # força root a ignorar lances ruins
+                # if capturas_oponente:
+                #     continue
                 jog_apos = Tabuleiro.get_oponente(cor_ia) if troca_turno else cor_ia
                 pd = (Peca.get_tipo(estado_d.peca_movida_original)==PEDRA)
                 ct_p = 0
