@@ -172,11 +172,12 @@ class Tabuleiro:
     def get_posicoes_pecas(self, c: int) -> List[Posicao]: return [(r,col) for r in range(TAMANHO_TABULEIRO) for col in range(TAMANHO_TABULEIRO) if Peca.get_cor(self.grid[r][col])==c]
 
     def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: Movimento, caps_cam: list) -> List[Movimento]:
+        # uma dama recém‐promovida não pode capturar neste mesmo turno
+        if pos_a in self.damas_recem_promovidas:
+            return []
         # --- se chegou à última linha como pedra, para na promoção: não captura mais ---
-        if tipo == PEDRA:
-            l_promo = 0 if cor == BRANCO else TAMANHO_TABULEIRO - 1
-            if pos_a[0] == l_promo:
-                return []
+        if tipo == PEDRA and self.chegou_para_promover(pos_a, cor):
+            return []
         key = (self.hash_atual, pos_a, cor, tipo, tuple(sorted(caps_cam)))
         if key in self._cache_capturas:
             return self._cache_capturas[key]
@@ -769,6 +770,11 @@ class Tabuleiro:
         opp_score = opp_p * VALOR_PEDRA + opp_d * VALOR_DAMA
         return allied_score - opp_score
 
+    def chegou_para_promover(self, pos: Posicao, cor: int) -> bool:
+        """Retorna True se a posição está na fileira de promoção para a cor dada."""
+        l_promo = 0 if cor == BRANCO else TAMANHO_TABULEIRO - 1
+        return pos[0] == l_promo
+
 # --- Classe Partida ---
 class Partida:
     def __init__(self, jogador_branco: str = "Humano", jogador_preto: str = "IA"):
@@ -856,7 +862,7 @@ class Partida:
 
 # --- Classe MotorIA (Versão com Iterative Deepening + Time Management) ---
 class MotorIA:
-    def __init__(self, profundidade: int, tempo_limite: float = TEMPO_PADRAO_IA, debug_heur: bool = False):
+    def __init__(self, profundidade: int, tempo_limite: float = TEMPO_PADRAO_IA, debug_heur: bool = False, usar_lmr: bool = True):
         self.profundidade_maxima = profundidade
         self.tempo_limite = tempo_limite
         self.nos_visitados = 0; self.nos_quiescence_visitados = 0; self.tt_hits = 0
@@ -877,6 +883,7 @@ class MotorIA:
         # Aspiration Windows
         self.melhor_score_prev: float = 0.0
         self.aspiration_delta: float = 15.0   # largura inicial da janela
+        self.usar_lmr = usar_lmr
 
     def limpar_tt_e_historico(self):
         self.transposition_table = OrderedDict(); self.killer_moves = [ [None, None] for _ in range(self.profundidade_maxima + 1)]; self.history_heuristic = defaultdict(int);
@@ -1117,7 +1124,8 @@ class MotorIA:
         movs_ordenados.extend(mov_caps); movs_ordenados.extend(mov_nao_caps)
         melhor_val = -float('inf'); melhor_mov_local = None
         # Loop Alpha-Beta NegaMax
-        for mov in movs_ordenados:
+        LMR_THRESHOLD = 4
+        for i, mov in enumerate(movs_ordenados):
             # Determinar se haverá troca de turno
             cp=bool(tab.identificar_pecas_capturadas(mov))
             pos_final = mov[-1]
@@ -1142,7 +1150,19 @@ class MotorIA:
                     ct_p = cont_emp + 1
             else:
                 ct_p = cont_emp
-            score = -self.minimax(tab, ct_p, prox_prof, -beta, -alpha, prox_jogador, cor_ia)
+            # --- Late Move Reductions (LMR) ---
+            is_tt = (mov == melhor_mov_tt)
+            is_killer = mov in killer_list
+            is_capture = mov in mov_caps
+            if self.usar_lmr and prof > 2 and i >= LMR_THRESHOLD and not is_tt and not is_killer and not is_capture:
+                # Pesquisa rasa (reduzida)
+                score = -self.minimax(tab, ct_p, prox_prof-1, -alpha-1, -alpha, prox_jogador, cor_ia)
+                if score > alpha:
+                    # Pesquisa completa se passou alpha
+                    score = -self.minimax(tab, ct_p, prox_prof, -beta, -alpha, prox_jogador, cor_ia)
+            else:
+                # Pesquisa normal
+                score = -self.minimax(tab, ct_p, prox_prof, -beta, -alpha, prox_jogador, cor_ia)
             tab._desfazer_lance(estado_d)
             if score > melhor_val: melhor_val = score; melhor_mov_local = mov
             alpha = max(alpha, melhor_val);
@@ -1306,49 +1326,59 @@ class MotorIA:
 
 # --- Bloco Principal (Teste) ---
 if __name__ == "__main__":
-     print("--- Testando damas_logic.py v12.3 Iterative Deepening + Time Management ---")
-     partida_teste = Partida(jogador_branco="IA", jogador_preto="Humano")
-     ia_teste = MotorIA(profundidade=PROFUNDIDADE_IA, tempo_limite=TEMPO_PADRAO_IA) # Usa tempo e profundidade configuráveis
-     print(f"Profundidade Máxima de Teste: {PROFUNDIDADE_IA}, Tempo Limite: {TEMPO_PADRAO_IA}s")
-     print("Estado Inicial:"); print(partida_teste.tabuleiro)
-     if partida_teste.jogador_atual == BRANCO:
-         print("\nCalculando movimento inicial para Brancas...")
-         start_time = time.time()
-         movimento_escolhido = ia_teste.encontrar_melhor_movimento(
-             partida_teste,
-             BRANCO,
-             partida_teste.movimentos_legais_atuais
-         )
-         end_time = time.time()
-         print(f"\n[Teste] Tempo de cálculo: {end_time - start_time:.2f}s")
-         if movimento_escolhido: print(f"[Teste] Movimento Sugerido: {ia_teste._formatar_movimento(movimento_escolhido)}")
-         else: print("[Teste] IA não encontrou movimento.")
-         
-         # Salvar estatísticas em um arquivo separado
-         with open("stats_ia.txt", "w") as f:
-             f.write("=== ESTATÍSTICAS DA IA ===\n")
-             f.write(f"Profundidade Máxima Configurada: {ia_teste.profundidade_maxima}\n")
-             f.write(f"Profundidade Completada: {ia_teste.profundidade_completa}\n")
-             f.write(f"Profundidade Real Atingida: {ia_teste.profundidade_real_atingida}\n")
-             f.write(f"Nós Visitados (Minimax): {ia_teste.nos_visitados}\n")
-             f.write(f"Nós Visitados (Quiescence): {ia_teste.nos_quiescence_visitados}\n")
-             f.write(f"Total de Nós: {ia_teste.nos_visitados + ia_teste.nos_quiescence_visitados}\n")
-             f.write(f"TT Hits: {ia_teste.tt_hits}\n")
-             f.write(f"Podas Alpha: {ia_teste.podas_alpha}\n")
-             f.write(f"Podas Beta: {ia_teste.podas_beta}\n")
-             f.write(f"Tempo Total: {end_time - start_time:.2f}s\n")
-             f.write(f"Nós por segundo: {(ia_teste.nos_visitados + ia_teste.nos_quiescence_visitados) / max(0.001, end_time - start_time):.0f}\n")
-             f.write("\nTempo por Nível de Profundidade:\n")
-             for nivel, tempo in sorted(ia_teste.tempo_por_nivel.items()):
-                 f.write(f"  - Nível {nivel}: {tempo:.4f}s\n")
-     print("\n--- Fim do Teste ---")
+    print("--- Testando damas_logic.py v12.3 Iterative Deepening + Time Management ---")
+    partida_teste = Partida(jogador_branco="IA", jogador_preto="Humano")
+    print(f"Profundidade Máxima de Teste: {PROFUNDIDADE_IA}, Tempo Limite: {TEMPO_PADRAO_IA}s")
+    print("Estado Inicial:"); print(partida_teste.tabuleiro)
+    if partida_teste.jogador_atual == BRANCO:
+        print("\n[COM LMR] Calculando movimento inicial para Brancas...")
+        ia_lmr = MotorIA(profundidade=PROFUNDIDADE_IA, tempo_limite=TEMPO_PADRAO_IA, debug_heur=True, usar_lmr=True)
+        start_time_lmr = time.time()
+        mov_lmr = ia_lmr.encontrar_melhor_movimento(
+            partida_teste,
+            BRANCO,
+            partida_teste.movimentos_legais_atuais
+        )
+        end_time_lmr = time.time()
+        print(f"\n[COM LMR] Tempo de cálculo: {end_time_lmr - start_time_lmr:.2f}s")
+        if mov_lmr: print(f"[COM LMR] Movimento Sugerido: {ia_lmr._formatar_movimento(mov_lmr)}")
+        else: print("[COM LMR] IA não encontrou movimento.")
+        print(f"[COM LMR] Nós Visitados (Minimax): {ia_lmr.nos_visitados}")
+        print(f"[COM LMR] Nós Visitados (Quiescence): {ia_lmr.nos_quiescence_visitados}")
+        print(f"[COM LMR] Profundidade Completada: {ia_lmr.profundidade_completa}")
+        print(f"[COM LMR] Profundidade Real Atingida: {ia_lmr.profundidade_real_atingida}")
+        print(f"[COM LMR] TT Hits: {ia_lmr.tt_hits}")
+        print(f"[COM LMR] Podas Alpha: {ia_lmr.podas_alpha}")
+        print(f"[COM LMR] Podas Beta: {ia_lmr.podas_beta}")
+        print(f"[COM LMR] Nós por segundo: {(ia_lmr.nos_visitados + ia_lmr.nos_quiescence_visitados) / max(0.001, end_time_lmr - start_time_lmr):.0f}")
 
-     # Testar avaliação de heurística
-     tabuleiro = partida_teste.tabuleiro
-     # As linhas abaixo são apenas para depuração detalhada da heurística. Comente para uso em produção.
-     # print("\n[DEBUG] Avaliação heurística para BRANCO:")
-     # tabuleiro.avaliar_heuristica(BRANCO, debug_aval=True)
-     # print("\n[DEBUG] Avaliação heurística para PRETO:")
-     # tabuleiro.avaliar_heuristica(PRETO, debug_aval=True)
-     ia = MotorIA(profundidade=12, tempo_limite=25.0, debug_heur=True)
+        print("\n[SEM LMR] Calculando movimento inicial para Brancas...")
+        ia_nolmr = MotorIA(profundidade=PROFUNDIDADE_IA, tempo_limite=TEMPO_PADRAO_IA, debug_heur=True, usar_lmr=False)
+        start_time_nolmr = time.time()
+        mov_nolmr = ia_nolmr.encontrar_melhor_movimento(
+            partida_teste,
+            BRANCO,
+            partida_teste.movimentos_legais_atuais
+        )
+        end_time_nolmr = time.time()
+        print(f"\n[SEM LMR] Tempo de cálculo: {end_time_nolmr - start_time_nolmr:.2f}s")
+        if mov_nolmr: print(f"[SEM LMR] Movimento Sugerido: {ia_nolmr._formatar_movimento(mov_nolmr)}")
+        else: print("[SEM LMR] IA não encontrou movimento.")
+        print(f"[SEM LMR] Nós Visitados (Minimax): {ia_nolmr.nos_visitados}")
+        print(f"[SEM LMR] Nós Visitados (Quiescence): {ia_nolmr.nos_quiescence_visitados}")
+        print(f"[SEM LMR] Profundidade Completada: {ia_nolmr.profundidade_completa}")
+        print(f"[SEM LMR] Profundidade Real Atingida: {ia_nolmr.profundidade_real_atingida}")
+        print(f"[SEM LMR] TT Hits: {ia_nolmr.tt_hits}")
+        print(f"[SEM LMR] Podas Alpha: {ia_nolmr.podas_alpha}")
+        print(f"[SEM LMR] Podas Beta: {ia_nolmr.podas_beta}")
+        print(f"[SEM LMR] Nós por segundo: {(ia_nolmr.nos_visitados + ia_nolmr.nos_quiescence_visitados) / max(0.001, end_time_nolmr - start_time_nolmr):.0f}")
+
+        print("\n=== COMPARATIVO LMR x SEM LMR ===")
+        print(f"Tempo (LMR): {end_time_lmr - start_time_lmr:.2f}s | (SEM LMR): {end_time_nolmr - start_time_nolmr:.2f}s")
+        print(f"Nós (LMR): {ia_lmr.nos_visitados} | (SEM LMR): {ia_nolmr.nos_visitados}")
+        print(f"Quiescence (LMR): {ia_lmr.nos_quiescence_visitados} | (SEM LMR): {ia_nolmr.nos_quiescence_visitados}")
+        print(f"Profundidade Completada (LMR): {ia_lmr.profundidade_completa} | (SEM LMR): {ia_nolmr.profundidade_completa}")
+        print(f"Movimento Sugerido (LMR): {ia_lmr._formatar_movimento(mov_lmr)} | (SEM LMR): {ia_nolmr._formatar_movimento(mov_nolmr)}")
+        print(f"Score final (LMR): {ia_lmr.melhor_score_prev:.2f} | (SEM LMR): {ia_nolmr.melhor_score_prev:.2f}")
+    print("\n--- Fim do Teste ---")
     
