@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 # damas_logic.py (v12.3: Iterative Deepening + Time Management)
 
-import copy
 import time
 import random
 from typing import List, Tuple, Optional, Dict, Set, NamedTuple
 from collections import defaultdict
+from collections import OrderedDict
+import statistics
 
 # --- Constantes ---
 BRANCO = 1; PRETO = -1; VAZIO = 0; PEDRA = 1; DAMA = 2; PB = 1; PP = -1; DB = 2; DP = -2
@@ -15,7 +16,6 @@ DIRECOES_DAMA = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
 TAMANHO_TABULEIRO = 8
 PROFUNDIDADE_IA = 12 # Profundidade máxima (aumentada)
 TEMPO_PADRAO_IA = 25.0 # Tempo padrão em segundos (ajustado para garantir até 25s)
-TEMPO_MIN_PROFUNDIDADE = 0.1 # Tempo mínimo para completar uma profundidade (segundos)
 
 # Definição de exceção para tempo excedido
 class TempoExcedidoError(Exception):
@@ -74,7 +74,6 @@ PSQT_DAMA = [
 MAX_QUIESCENCE_DEPTH = 5 # Reduzido para enxugar a busca de quiescência
 TT_TAMANHO_MB = 128; TT_ENTRIES = (TT_TAMANHO_MB * 1024 * 1024) // 32
 TT_FLAG_EXACT = 0; TT_FLAG_LOWERBOUND = 1; TT_FLAG_UPPERBOUND = 2
-EXTENSAO_CAPTURA = 1  # Pode ajustar para 2 se quiser mais agressivo
 
 # --- Tipos e Estruturas Auxiliares ---
 Posicao = Tuple[int, int]; Movimento = List[Posicao]
@@ -92,6 +91,7 @@ class TTEntry(NamedTuple):
 # --- Zobrist Hashing ---
 ZOBRIST_TABELA = [[[random.randint(1, 2**64 - 1) for _ in range(5)] for _ in range(TAMANHO_TABULEIRO)] for _ in range(TAMANHO_TABULEIRO)]
 ZOBRIST_VEZ_PRETA = random.randint(1, 2**64 - 1)
+Z_PROM = [[random.randint(1, 2**64 - 1) for _ in range(TAMANHO_TABULEIRO)] for _ in range(TAMANHO_TABULEIRO)]
 
 # --- Classe Peca ---
 class Peca:
@@ -125,6 +125,7 @@ class Tabuleiro:
             for c in range(TAMANHO_TABULEIRO):
                 if (r+c)%2!=0: self.grid[r][c]=PP if r<3 else (PB if r>4 else VAZIO)
                 else: self.grid[r][c]=VAZIO
+        self.limpar_cache_capturas()
 
     def calcular_hash_zobrist_inicial(self) -> int:
         h=0;
@@ -152,9 +153,18 @@ class Tabuleiro:
             if pa!=VAZIO: self._atualizar_hash_zobrist(r,c,pa)
             self.grid[r][c]=v
             if v!=VAZIO: self._atualizar_hash_zobrist(r,c,v)
+            self.limpar_cache_capturas()
 
-    def mover_peca(self, o: Posicao, d: Posicao): p=self.get_peca(o); self.set_peca(o, VAZIO); self.set_peca(d, p)
-    def remover_peca(self, p: Posicao): self.set_peca(p, VAZIO)
+    def mover_peca(self, o: Posicao, d: Posicao):
+        p=self.get_peca(o)
+        self.set_peca(o, VAZIO)
+        self.set_peca(d, p)
+        self.limpar_cache_capturas()
+
+    def remover_peca(self, p: Posicao):
+        self.set_peca(p, VAZIO)
+        self.limpar_cache_capturas()
+
     @staticmethod
     def is_valido(r: int, c: int) -> bool: return 0<=r<TAMANHO_TABULEIRO and 0<=c<TAMANHO_TABULEIRO
     @staticmethod
@@ -162,6 +172,12 @@ class Tabuleiro:
     def get_posicoes_pecas(self, c: int) -> List[Posicao]: return [(r,col) for r in range(TAMANHO_TABULEIRO) for col in range(TAMANHO_TABULEIRO) if Peca.get_cor(self.grid[r][col])==c]
 
     def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: Movimento, caps_cam: list) -> List[Movimento]:
+        # uma dama recém‐promovida não pode capturar neste mesmo turno
+        if pos_a in self.damas_recem_promovidas:
+            return []
+        # --- se chegou à última linha como pedra, para na promoção: não captura mais ---
+        if tipo == PEDRA and self.chegou_para_promover(pos_a, cor):
+            return []
         key = (self.hash_atual, pos_a, cor, tipo, tuple(sorted(caps_cam)))
         if key in self._cache_capturas:
             return self._cache_capturas[key]
@@ -222,15 +238,17 @@ class Tabuleiro:
     def encontrar_movimentos_possiveis(self, cor: int, apenas_capturas: bool = False) -> List[Movimento]:
         all_capturas = []
         simples = []
+        capturas_por_pos = {}
         for pos_i in self.get_posicoes_pecas(cor):
             if pos_i in self.damas_recem_promovidas:
                 continue
             pv = self.get_peca(pos_i)
             tipo = Peca.get_tipo(pv)
-            caps_peca = self._encontrar_capturas_recursivo(pos_i, cor, tipo, [pos_i], [])
+            if pos_i not in capturas_por_pos:
+                capturas_por_pos[pos_i] = self._encontrar_capturas_recursivo(pos_i, cor, tipo, [pos_i], [])
+            caps_peca = capturas_por_pos[pos_i]
             if caps_peca:
                 all_capturas.extend(caps_peca)
-                pass
         if all_capturas:
             max_caps = max(len(seq)-1 for seq in all_capturas)
             return [seq for seq in all_capturas if len(seq)-1 == max_caps]
@@ -278,6 +296,7 @@ class Tabuleiro:
         return caps
 
     def _fazer_lance(self, mov: Movimento, troca_turno: bool = True) -> EstadoLanceDesfazer:
+        self.limpar_cache_capturas()
         o=mov[0]; d=mov[-1]; h_a=self.hash_atual; p_o=self.get_peca(o); c=Peca.get_cor(p_o); t_o=Peca.get_tipo(p_o)
         pc=self.identificar_pecas_capturadas(mov); self.mover_peca(o,d);
         for pos_c in pc: self.remover_peca(pos_c)
@@ -287,6 +306,7 @@ class Tabuleiro:
             nv=DB if c==BRANCO else DP;
             self.set_peca(d,nv);
             pr=True
+            self.hash_atual ^= Z_PROM[d[0]][d[1]]
             self.damas_recem_promovidas.add(d)
             damas_adicionadas.add(d)
         if troca_turno:
@@ -294,11 +314,13 @@ class Tabuleiro:
         return EstadoLanceDesfazer(mov,p_o,pc,pr,h_a,damas_adicionadas, troca_turno)
 
     def _desfazer_lance(self, e: EstadoLanceDesfazer):
+        self.limpar_cache_capturas()
         self.hash_atual=e.hash_anterior; mov=e.movimento; o=mov[0]; d=mov[-1]; p_r=e.peca_movida_original
         self.grid[d[0]][d[1]]=VAZIO; self.grid[o[0]][o[1]]=p_r;
         for pos_c,val_c in e.pecas_capturadas.items(): self.grid[pos_c[0]][pos_c[1]] = val_c
         for pos in e.damas_recem_promovidas_adicionadas:
             if pos in self.damas_recem_promovidas:
+                self.hash_atual ^= Z_PROM[pos[0]][pos[1]]
                 self.damas_recem_promovidas.remove(pos)
         if e.troca_turno:
             self._atualizar_hash_turno()
@@ -541,7 +563,7 @@ class Tabuleiro:
         nova_copia = Tabuleiro(estado_inicial=False)  # Cria um tabuleiro vazio
         nova_copia.grid = [linha[:] for linha in self.grid]  # Copia profunda da grade
         nova_copia.hash_atual = self.hash_atual
-        nova_copia.damas_recem_promovidas = set()  # Não propaga damas recém-promovidas para buscas
+        nova_copia.damas_recem_promovidas = set(self.damas_recem_promovidas)  # Propaga flags de promoção
         return nova_copia
 
     def limpar_damas_recem_promovidas_por_cor(self, cor: int):
@@ -559,72 +581,71 @@ class Tabuleiro:
         
         # Remover as damas da cor especificada
         for pos in damas_para_remover:
+            self.hash_atual ^= Z_PROM[pos[0]][pos[1]]
             self.damas_recem_promovidas.remove(pos)
 
     def eh_peca_vulneravel(self, r: int, c: int, cache_vulneravel: dict = None) -> bool:
         """
-        Retorna True se a peça em (r, c) pode ser capturada
-        no próximo lance do adversário (captura imediata).
-        Usa cache local para evitar recomputação em nós de avaliação.
+        Retorna True se a peça em (r, c) pode ser capturada imediatamente por uma peça adversária adjacente (profundidade 1).
+        Não faz busca recursiva nem combos.
         """
-        if cache_vulneravel is None:
-            cache_vulneravel = {}
-        chave = (self.hash_atual, r, c)
-        if chave in cache_vulneravel:
-            return cache_vulneravel[chave]
         cor_peca = Peca.get_cor(self.grid[r][c])
         if cor_peca == VAZIO:
-            cache_vulneravel[chave] = False
+            if cache_vulneravel is not None:
+                cache_vulneravel[(r, c)] = False
             return False
         cor_oponente = self.get_oponente(cor_peca)
-        posicoes_oponente = self.get_posicoes_pecas(cor_oponente)
-        for pos_op in posicoes_oponente:
-            peca_op = self.grid[pos_op[0]][pos_op[1]]
-            tipo_op = Peca.get_tipo(peca_op)
-            capturas_pos_op = self._encontrar_capturas_recursivo(pos_op, cor_oponente, tipo_op, [pos_op], [])
-            for cap_seq in capturas_pos_op:
-                pecas_capturadas = self.identificar_pecas_capturadas(cap_seq)
-                if (r, c) in pecas_capturadas:
-                    cache_vulneravel[chave] = True  # Early-exit e cache
-                    return True
-        cache_vulneravel[chave] = False
+        tipo_peca = Peca.get_tipo(self.grid[r][c])
+        dirs = DIRECOES_CAPTURA_PEDRA if tipo_peca == PEDRA else DIRECOES_DAMA
+        for dr, dc in dirs:
+            r_op, c_op = r + dr, c + dc
+            r_dest, c_dest = r - dr, c - dc
+            if self.is_valido(r_op, c_op) and self.is_valido(r_dest, c_dest):
+                peca_op = self.grid[r_op][c_op]
+                if Peca.get_cor(peca_op) == cor_oponente:
+                    tipo_op = Peca.get_tipo(peca_op)
+                    # Só permite captura se destino está vazio e tipo permite
+                    if self.grid[r_dest][c_dest] == VAZIO:
+                        if tipo_op == DAMA or (tipo_op == PEDRA and ((cor_oponente == BRANCO and dr == -1) or (cor_oponente == PRETO and dr == 1))):
+                            if cache_vulneravel is not None:
+                                cache_vulneravel[(r, c)] = True
+                            return True
+        if cache_vulneravel is not None:
+            cache_vulneravel[(r, c)] = False
         return False
 
     def eh_peca_protegida(self, r: int, c: int) -> bool:
         """
-        Retorna True se a peça em (r, c) está protegida,
-        isto é, se qualquer captura do adversário que pegue essa peça
-        resultaria em contra-captura imediata.
+        Retorna True se a peça em (r, c) está "protegida" contra capturas adjacentes (profundidade 1):
+        após uma captura adjacente, existe uma peça aliada adjacente ao destino que poderia recapturar imediatamente.
+        Não faz busca recursiva nem combos.
         """
         cor_peca = Peca.get_cor(self.grid[r][c])
         if cor_peca == VAZIO:
             return False
         cor_oponente = self.get_oponente(cor_peca)
-        posicoes_oponente = self.get_posicoes_pecas(cor_oponente)
-        for pos_op in posicoes_oponente:
-            peca_op = self.grid[pos_op[0]][pos_op[1]]
-            tipo_op = Peca.get_tipo(peca_op)
-            capturas_pos_op = self._encontrar_capturas_recursivo(pos_op, cor_oponente, tipo_op, [pos_op], [])
-            for cap_seq in capturas_pos_op:
-                pecas_capturadas = self.identificar_pecas_capturadas(cap_seq)
-                if (r, c) in pecas_capturadas:
-                    # Essa jogada do adversário captura (r,c).
-                    # Vamos simular no tabuleiro fictício
-                    tab_temp = self.criar_copia()
-                    state_desf = tab_temp._fazer_lance(cap_seq, troca_turno=True)  # Simulação: troca_turno=True pois é lance "normal"
-                    nova_pos = cap_seq[-1]
-                    # Checar se nós temos algum movimento de captura que pega nova_pos
-                    posicoes_nossas = tab_temp.get_posicoes_pecas(cor_peca)
-                    for p_nossa in posicoes_nossas:
-                        peca_nossa = tab_temp.grid[p_nossa[0]][p_nossa[1]]
-                        tipo_nossa = Peca.get_tipo(peca_nossa)
-                        caps_nossas = tab_temp._encontrar_capturas_recursivo(
-                            p_nossa, cor_peca, tipo_nossa, [p_nossa], []
-                        )
-                        for seq_nossa in caps_nossas:
-                            pecas_capt_nossas = tab_temp.identificar_pecas_capturadas(seq_nossa)
-                            if nova_pos in pecas_capt_nossas:
-                                return True
+        tipo_peca = Peca.get_tipo(self.grid[r][c])
+        dirs = DIRECOES_CAPTURA_PEDRA if tipo_peca == PEDRA else DIRECOES_DAMA
+        for dr, dc in dirs:
+            r_op, c_op = r + dr, c + dc
+            r_dest, c_dest = r - dr, c - dc
+            if self.is_valido(r_op, c_op) and self.is_valido(r_dest, c_dest):
+                peca_op = self.grid[r_op][c_op]
+                if Peca.get_cor(peca_op) == cor_oponente:
+                    tipo_op = Peca.get_tipo(peca_op)
+                    if self.grid[r_dest][c_dest] == VAZIO:
+                        if tipo_op == DAMA or (tipo_op == PEDRA and ((cor_oponente == BRANCO and dr == -1) or (cor_oponente == PRETO and dr == 1))):
+                            # Agora, verifica se há uma peça aliada adjacente ao destino que pode recapturar
+                            for dr2, dc2 in DIRECOES_CAPTURA_PEDRA if tipo_peca == PEDRA else DIRECOES_DAMA:
+                                r_ali, c_ali = r_dest + dr2, c_dest + dc2
+                                r_recapt, c_recapt = r_dest - dr2, c_dest - dc2
+                                if self.is_valido(r_ali, c_ali) and self.is_valido(r_recapt, c_recapt):
+                                    peca_ali = self.grid[r_ali][c_ali]
+                                    if Peca.get_cor(peca_ali) == cor_peca:
+                                        tipo_ali = Peca.get_tipo(peca_ali)
+                                        if self.grid[r_recapt][c_recapt] == VAZIO:
+                                            if tipo_ali == DAMA or (tipo_ali == PEDRA and ((cor_peca == BRANCO and dr2 == -1) or (cor_peca == PRETO and dr2 == 1))):
+                                                return True
         return False
 
     def tem_pedras_conectadas(self, r: int, c: int) -> bool:
@@ -749,6 +770,11 @@ class Tabuleiro:
         opp_score = opp_p * VALOR_PEDRA + opp_d * VALOR_DAMA
         return allied_score - opp_score
 
+    def chegou_para_promover(self, pos: Posicao, cor: int) -> bool:
+        """Retorna True se a posição está na fileira de promoção para a cor dada."""
+        l_promo = 0 if cor == BRANCO else TAMANHO_TABULEIRO - 1
+        return pos[0] == l_promo
+
 # --- Classe Partida ---
 class Partida:
     def __init__(self, jogador_branco: str = "Humano", jogador_preto: str = "IA"):
@@ -836,11 +862,11 @@ class Partida:
 
 # --- Classe MotorIA (Versão com Iterative Deepening + Time Management) ---
 class MotorIA:
-    def __init__(self, profundidade: int, tempo_limite: float = TEMPO_PADRAO_IA, debug_heur: bool = False):
+    def __init__(self, profundidade: int, tempo_limite: float = TEMPO_PADRAO_IA, debug_heur: bool = False, usar_lmr: bool = True):
         self.profundidade_maxima = profundidade
         self.tempo_limite = tempo_limite
         self.nos_visitados = 0; self.nos_quiescence_visitados = 0; self.tt_hits = 0
-        self.transposition_table: Dict[int, TTEntry] = {}
+        self.transposition_table: 'OrderedDict[int, TTEntry]' = OrderedDict()
         self.killer_moves: List[List[Optional[Movimento]]] = [ [None, None] for _ in range(profundidade + 1)]
         self.history_heuristic: Dict[Tuple[Posicao, Posicao], int] = defaultdict(int)
         # Contadores de diagnóstico adicionados
@@ -854,9 +880,13 @@ class MotorIA:
         self.melhor_movimento_atual = None
         self.profundidade_completa = 0
         self.debug_heur = debug_heur
+        # Aspiration Windows
+        self.melhor_score_prev: float = 0.0
+        self.aspiration_delta: float = 15.0   # largura inicial da janela
+        self.usar_lmr = usar_lmr
 
     def limpar_tt_e_historico(self):
-        self.transposition_table = {}; self.killer_moves = [ [None, None] for _ in range(self.profundidade_maxima + 1)]; self.history_heuristic = defaultdict(int);
+        self.transposition_table = OrderedDict(); self.killer_moves = [ [None, None] for _ in range(self.profundidade_maxima + 1)]; self.history_heuristic = defaultdict(int);
         # Resetar contadores de diagnóstico
         self.profundidade_real_atingida = 0
         self.podas_alpha = 0
@@ -900,79 +930,86 @@ class MotorIA:
             if self.tempo_acabou:
                 print(f"[IA] Tempo limite atingido. Usando melhor mov da prof {self.profundidade_completa}")
                 break
-                
+
+            # --- Aspiration Windows ---
+            if prof_atual == 1:
+                alpha, beta = -float('inf'), float('inf')
+            else:
+                alpha = self.melhor_score_prev - self.aspiration_delta
+                beta  = self.melhor_score_prev + self.aspiration_delta
+            alpha_asp = alpha
+            beta_asp = beta
+
             tempo_inicio_prof = time.time()
-            alpha = -float('inf'); beta = float('inf')
             movs_avaliados = {}
-            
-            # Ordenação raiz para esta profundidade
-            mov_caps_raiz = [m for m in movimentos_legais if len(tab_copia.identificar_pecas_capturadas(m)) > 0]
-            mov_simples_raiz = [m for m in movimentos_legais if m not in mov_caps_raiz]
-            mov_simples_raiz.sort(key=lambda m: self.history_heuristic.get(self._mov_para_chave_history(m), 0), reverse=True)
-            movs_ord_raiz = mov_caps_raiz + mov_simples_raiz
-            
-            # Usar último melhor movimento primeiro (se existir e não for captura)
-            if self.melhor_movimento_atual in mov_simples_raiz:
-                mov_simples_raiz.remove(self.melhor_movimento_atual)
-                movs_ord_raiz = mov_caps_raiz + [self.melhor_movimento_atual] + mov_simples_raiz
-                
             melhor_score_prof = -float('inf')
-            melhor_mov_prof = None
-            
+            melhor_mov_prof   = None
+
+            cache_capturas_oponente = {}
             try:
-                for mov in movs_ord_raiz:
-                    if self.verificar_tempo(): raise TempoExcedidoError("Tempo excedido durante avaliação de movimentos")
-                    # Determinar se haverá troca de turno
-                    cp = bool(tab_copia.identificar_pecas_capturadas(mov))
-                    pos_final = mov[-1]
-                    peca_final = tab_copia.get_peca(pos_final)
-                    tipo_final = Peca.get_tipo(peca_final)
-                    capturas_combo = tab_copia._encontrar_capturas_recursivo(pos_final, cor_ia, tipo_final, [pos_final], []) if cp else []
-                    troca_turno = not (cp and capturas_combo)
-                    estado_d = tab_copia._fazer_lance(mov, troca_turno=troca_turno)
-                    # --- FILTRO DE LANCES SUICIDAS ---
-                    cor_op = Tabuleiro.get_oponente(cor_ia) if troca_turno else cor_ia
-                    if tab_copia.encontrar_movimentos_possiveis(cor_op, apenas_capturas=True):
-                        tab_copia._desfazer_lance(estado_d)
-                        continue  # pula esse movimento inteiramente
-                    # ... caso contrário, chama minimax normalmente
-                    jog_apos = Tabuleiro.get_oponente(cor_ia) if troca_turno else cor_ia
-                    pd = (Peca.get_tipo(estado_d.peca_movida_original)==PEDRA)
-                    ct_p = 0
-                    score = -self.minimax(tab_copia, ct_p, prof_atual - 1, -beta, -alpha, jog_apos, cor_ia) # NegaMax
-                    tab_copia._desfazer_lance(estado_d)  # Desfazer o movimento após análise
-                    
-                    movs_avaliados[self._formatar_movimento(mov)] = score
-                    
-                    if score > melhor_score_prof:
-                        melhor_score_prof = score
-                        melhor_mov_prof = mov
-                        
-                    alpha = max(alpha, melhor_score_prof)
-                    
-                    if self.verificar_tempo(): raise TempoExcedidoError("Tempo excedido após avaliação de um movimento")
-            
-                # Atualizar melhor movimento se completou a profundidade sem erros
-                if melhor_mov_prof:
-                    self.melhor_movimento_atual = melhor_mov_prof
-                    self.profundidade_completa = prof_atual
+                # Ordenação raiz para esta profundidade
+                mov_caps_raiz = [m for m in movimentos_legais if len(tab_copia.identificar_pecas_capturadas(m)) > 0]
+                mov_simples_raiz = [m for m in movimentos_legais if m not in mov_caps_raiz]
+                # Ordenar capturas por MVV/LVA (valor capturado, depois atacante)
+                def valor_captura_mvv_lva(m):
+                    capturadas = tab_copia.identificar_pecas_capturadas(m)
+                    if not capturadas:
+                        return (0, 0)
+                    valor_capt = max(abs(v) for v in capturadas.values())  # Mais valiosa vítima
+                    atacante = abs(tab_copia.get_peca(m[0]))
+                    # DAMA=2, PEDRA=1, então menor é melhor para LVA
+                    return (valor_capt, -atacante)
+                mov_caps_raiz = sorted(mov_caps_raiz, key=valor_captura_mvv_lva, reverse=True)
+                mov_simples_raiz.sort(key=lambda m: self.history_heuristic.get(self._mov_para_chave_history(m), 0), reverse=True)
+                movs_ord_raiz = mov_caps_raiz + mov_simples_raiz
+                # Usar último melhor movimento primeiro (se existir e não for captura)
+                if self.melhor_movimento_atual in movs_ord_raiz:
+                    movs_ord_raiz.remove(self.melhor_movimento_atual)
+                    movs_ord_raiz = [self.melhor_movimento_atual] + movs_ord_raiz
+                # Inserir TT-move no topo, se existir e for legal
+                tt_entry = self.transposition_table.get(tab_copia.hash_atual)
+                if tt_entry and tt_entry.melhor_movimento and tt_entry.melhor_movimento in movimentos_legais:
+                    if tt_entry.melhor_movimento in movs_ord_raiz:
+                        movs_ord_raiz.remove(tt_entry.melhor_movimento)
+                    movs_ord_raiz = [tt_entry.melhor_movimento] + movs_ord_raiz
+
+                # Busca principal com janela aspiration
+                melhor_score_prof, melhor_mov_prof, movs_avaliados = self._search_root(
+                    tab_copia, prof_atual, alpha, beta, movs_ord_raiz, cor_ia, cache_capturas_oponente)
+                self.profundidade_completa = prof_atual
+                resultados_por_profundidade[prof_atual] = movs_avaliados
+                self.melhor_movimento_atual = melhor_mov_prof
+
+                # Aspiration fail: relança com janela ampla
+                if melhor_score_prof <= alpha_asp or melhor_score_prof >= beta_asp:
+                    print(f"[IA] Aspiration fail na prof {prof_atual} (score={melhor_score_prof:.2f} fora de [{alpha_asp:.2f},{beta_asp:.2f}]), relançando com janela ampla")
+                    melhor_score_prof, melhor_mov_prof, movs_avaliados = self._search_root(
+                        tab_copia, prof_atual, -float('inf'), float('inf'), movs_ord_raiz, cor_ia, cache_capturas_oponente)
                     resultados_por_profundidade[prof_atual] = movs_avaliados
-                
+                    self.melhor_movimento_atual = melhor_mov_prof
+
+                # Ajuste dinâmico do aspiration_delta com base na dispersão dos scores
+                scores = list(movs_avaliados.values())
+                if len(scores) > 1:
+                    stddev = statistics.stdev(scores)
+                    self.aspiration_delta = max(2.0, min(30.0, stddev * 2.5))
+                else:
+                    self.aspiration_delta = 15.0
+
+                # Atualiza melhor_score_prev para próxima profundidade
+                self.melhor_score_prev = melhor_score_prof
+
                 tempo_prof = time.time() - tempo_inicio_prof
-                print(f"[IA] Prof {prof_atual} completa em {tempo_prof:.2f}s: {self._formatar_movimento(melhor_mov_prof)} (Score: {melhor_score_prof:.3f})")
-                tempo_restante = self.tempo_limite - (time.time() - self.tempo_inicio)
+                self.tempo_por_nivel[prof_atual] = tempo_prof
+                # --- Estimativa de tempo para próxima profundidade ---
                 if prof_atual > 1:
                     tempo_prev = self.tempo_por_nivel[prof_atual - 1]
-                    estimativa_next = tempo_prof * (tempo_prof / tempo_prev if tempo_prev > 0 else 1)
+                    taxa = tempo_prof / tempo_prev if tempo_prev > 0 else 1
+                    estimativa_next = tempo_prof * min(taxa, 2)
+                    tempo_restante = self.tempo_limite - (time.time() - self.tempo_inicio)
                     if estimativa_next > tempo_restante:
                         print(f"[IA] Estimativa de tempo para próxima profundidade ({estimativa_next:.2f}s) excede o tempo restante ({tempo_restante:.2f}s). Parando em {prof_atual}.")
                         break
-                    
-                # Verificar novamente se o tempo acabou
-                if self.verificar_tempo():
-                    print(f"[IA] Tempo limite atingido após completar profundidade {prof_atual}")
-                    break
-                    
             except TempoExcedidoError as e:
                 print(f"[IA] {str(e)} na profundidade {prof_atual}")
                 break
@@ -980,32 +1017,35 @@ class MotorIA:
         end_time_total = time.time()
         
         # Mostrar último resultado completo
-        if self.profundidade_completa > 0 and self.profundidade_completa in resultados_por_profundidade:
+        if self.debug_heur and self.profundidade_completa > 0 and self.profundidade_completa in resultados_por_profundidade:
             print(f"\n[IA] Avaliação final (profundidade {self.profundidade_completa}):")
             res_ord = sorted(resultados_por_profundidade[self.profundidade_completa].items(), key=lambda item: item[1], reverse=True)
             for mov_s, score_m in res_ord[:5]: # Mostrar apenas os 5 melhores para não poluir
                 print(f"  - Movimento: {mov_s:<15} -> Score: {score_m:.3f}")
                 
         if self.melhor_movimento_atual:
-            print(f"\n[IA] Escolhido: {self._formatar_movimento(self.melhor_movimento_atual)} (Prof: {self.profundidade_completa})")
+            if self.debug_heur:
+                print(f"\n[IA] Escolhido: {self._formatar_movimento(self.melhor_movimento_atual)} (Prof: {self.profundidade_completa})")
         else:
-            print("[IA] Nenhum movimento válido encontrado/escolhido.")
+            if self.debug_heur:
+                print("[IA] Nenhum movimento válido encontrado/escolhido.")
             self.melhor_movimento_atual = random.choice(movimentos_legais) if movimentos_legais else None
             
         # Estatísticas detalhadas
-        print(f"[IA] Nós (Minimax): {self.nos_visitados}, (Quiescence): {self.nos_quiescence_visitados}, TT Hits: {self.tt_hits}")
-        print(f"[IA] Profundidade Máxima Configurada: {self.profundidade_maxima}, Profundidade Completada: {self.profundidade_completa}")
-        print(f"[IA] Profundidade Real Atingida: {self.profundidade_real_atingida}")
-        print(f"[IA] Podas Alpha: {self.podas_alpha}, Podas Beta: {self.podas_beta}")
-        print(f"[IA] Tempo Total da Busca: {end_time_total - start_time_total:.2f}s")
-        print(f"[IA] Média de nós por segundo: {(self.nos_visitados + self.nos_quiescence_visitados) / max(0.001, end_time_total - start_time_total):.0f}")
-        print("-" * 30)
+        if self.debug_heur:
+            print(f"[IA] Nós (Minimax): {self.nos_visitados}, (Quiescence): {self.nos_quiescence_visitados}, TT Hits: {self.tt_hits}")
+            print(f"[IA] Profundidade Máxima Configurada: {self.profundidade_maxima}, Profundidade Completada: {self.profundidade_completa}")
+            print(f"[IA] Profundidade Real Atingida: {self.profundidade_real_atingida}")
+            print(f"[IA] Podas Alpha: {self.podas_alpha}, Podas Beta: {self.podas_beta}")
+            print(f"[IA] Tempo Total da Busca: {end_time_total - start_time_total:.2f}s")
+            print(f"[IA] Média de nós por segundo: {(self.nos_visitados + self.nos_quiescence_visitados) / max(0.001, end_time_total - start_time_total):.0f}")
+            print("-" * 30)
 
         # Instrumentação: heurística pura para cada root move
         print("=== Heurística pura (depth=0) para cada root move ===")
         for mov in movimentos_legais:
             estado = tab_copia._fazer_lance(mov, troca_turno=True)
-            val = tab_copia.avaliar_heuristica(cor_ia, debug_aval=True)
+            val = tab_copia.avaliar_heuristica(cor_ia, debug_aval=False)
             tab_copia._desfazer_lance(estado)
             print(f"  {self._formatar_movimento(mov):10} -> {val:.3f}")
         print("=============================================")
@@ -1048,7 +1088,6 @@ class MotorIA:
         # Quiescência
         if prof <= 0: return self.quiescence_search(tab, MAX_QUIESCENCE_DEPTH, alpha, beta, jog, cor_ia)
         # Movimentos
-        tab.limpar_cache_capturas()  # Limpa o cache de capturas a cada nó
         movs = tab.encontrar_movimentos_possiveis(jog)
         # if self.debug:
         #     print(f"[minimax]   Nó prof={prof} jogador={jog}: {len(movs)} movimentos gerados")
@@ -1085,7 +1124,8 @@ class MotorIA:
         movs_ordenados.extend(mov_caps); movs_ordenados.extend(mov_nao_caps)
         melhor_val = -float('inf'); melhor_mov_local = None
         # Loop Alpha-Beta NegaMax
-        for mov in movs_ordenados:
+        LMR_THRESHOLD = 4
+        for i, mov in enumerate(movs_ordenados):
             # Determinar se haverá troca de turno
             cp=bool(tab.identificar_pecas_capturadas(mov))
             pos_final = mov[-1]
@@ -1110,7 +1150,19 @@ class MotorIA:
                     ct_p = cont_emp + 1
             else:
                 ct_p = cont_emp
-            score = -self.minimax(tab, ct_p, prox_prof, -beta, -alpha, prox_jogador, cor_ia)
+            # --- Late Move Reductions (LMR) ---
+            is_tt = (mov == melhor_mov_tt)
+            is_killer = mov in killer_list
+            is_capture = mov in mov_caps
+            if self.usar_lmr and prof > 2 and i >= LMR_THRESHOLD and not is_tt and not is_killer and not is_capture:
+                # Pesquisa rasa (reduzida)
+                score = -self.minimax(tab, ct_p, prox_prof-1, -alpha-1, -alpha, prox_jogador, cor_ia)
+                if score > alpha:
+                    # Pesquisa completa se passou alpha
+                    score = -self.minimax(tab, ct_p, prox_prof, -beta, -alpha, prox_jogador, cor_ia)
+            else:
+                # Pesquisa normal
+                score = -self.minimax(tab, ct_p, prox_prof, -beta, -alpha, prox_jogador, cor_ia)
             tab._desfazer_lance(estado_d)
             if score > melhor_val: melhor_val = score; melhor_mov_local = mov
             alpha = max(alpha, melhor_val);
@@ -1123,15 +1175,21 @@ class MotorIA:
                  chave_hist = self._mov_para_chave_history(mov)
                  if chave_hist and not cp: self.history_heuristic[chave_hist] += prof * prof
                  break
-        # Armazenamento TT
-        flag = TT_FLAG_EXACT;
-        if melhor_val <= a_orig: 
+        # Determinar flag TT corretamente
+        if melhor_val <= a_orig:
             flag = TT_FLAG_UPPERBOUND
             self.podas_alpha += 1  # Contador de podas alpha
-        elif melhor_val >= beta: 
+        elif melhor_val >= beta:
             flag = TT_FLAG_LOWERBOUND
             self.podas_beta += 1  # Contador de podas beta
+        else:
+            flag = TT_FLAG_EXACT
+        # LRU: se já existe, move para o fim; se não, adiciona e remove o mais antigo se necessário
+        if hash_pos in self.transposition_table:
+            self.transposition_table.move_to_end(hash_pos)
         self.transposition_table[hash_pos] = TTEntry(prof, melhor_val, flag, melhor_mov_local)
+        if len(self.transposition_table) > TT_ENTRIES:
+            self.transposition_table.popitem(last=False)
         # Registrar tempo gasto neste nível
         nivel_fim = time.time()
         self.tempo_por_nivel[prof_atual] += nivel_fim - nivel_inicio
@@ -1146,7 +1204,7 @@ class MotorIA:
         entry = self.transposition_table.get(hash_pos)
         if entry and entry.flag == TT_FLAG_EXACT and entry.profundidade >= -1 : self.tt_hits+=1; return entry.score
         self.nos_quiescence_visitados += 1
-        stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=True)
+        stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=False)
         mov_caps = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
         if mov_caps:
             def valor_captura(m):
@@ -1228,51 +1286,99 @@ class MotorIA:
             'janelas_usadas': []
         }
 
+    def _search_root(self, tab, prof, alpha, beta, movs_ord_raiz, cor_ia, cache_capturas_oponente):
+        resultados = {}
+        best_score = -float('inf')
+        best_move = None
+        for mov in movs_ord_raiz:
+            if self.verificar_tempo(): raise TempoExcedidoError("Tempo excedido durante avaliação de movimentos")
+            cp = bool(tab.identificar_pecas_capturadas(mov))
+            pos_final = mov[-1]
+            peca_final = tab.get_peca(pos_final)
+            tipo_final = Peca.get_tipo(peca_final)
+            capturas_combo = tab._encontrar_capturas_recursivo(pos_final, cor_ia, tipo_final, [pos_final], []) if cp else []
+            troca_turno = not (cp and capturas_combo)
+            estado_d = tab._fazer_lance(mov, troca_turno=troca_turno)
+            try:
+                cor_op = Tabuleiro.get_oponente(cor_ia) if troca_turno else cor_ia
+                hash_apos = tab.hash_atual
+                if hash_apos in cache_capturas_oponente:
+                    capturas_oponente = cache_capturas_oponente[hash_apos]
+                else:
+                    capturas_oponente = tab.encontrar_movimentos_possiveis(cor_op, apenas_capturas=True)
+                    cache_capturas_oponente[hash_apos] = capturas_oponente
+                if capturas_oponente:
+                    continue
+                jog_apos = Tabuleiro.get_oponente(cor_ia) if troca_turno else cor_ia
+                pd = (Peca.get_tipo(estado_d.peca_movida_original)==PEDRA)
+                ct_p = 0
+                score = -self.minimax(tab, ct_p, prof - 1, -beta, -alpha, jog_apos, cor_ia)
+                fmt = self._formatar_movimento(mov)
+                resultados[fmt] = score
+                if score > best_score:
+                    best_score = score
+                    best_move = mov
+                alpha = max(alpha, best_score)
+                if self.verificar_tempo(): raise TempoExcedidoError("Tempo excedido após avaliação de um movimento")
+            finally:
+                tab._desfazer_lance(estado_d)
+        return best_score, best_move, resultados
+
 # --- Bloco Principal (Teste) ---
 if __name__ == "__main__":
-     print("--- Testando damas_logic.py v12.3 Iterative Deepening + Time Management ---")
-     partida_teste = Partida(jogador_branco="IA", jogador_preto="Humano")
-     ia_teste = MotorIA(profundidade=PROFUNDIDADE_IA, tempo_limite=TEMPO_PADRAO_IA) # Usa tempo e profundidade configuráveis
-     print(f"Profundidade Máxima de Teste: {PROFUNDIDADE_IA}, Tempo Limite: {TEMPO_PADRAO_IA}s")
-     print("Estado Inicial:"); print(partida_teste.tabuleiro)
-     if partida_teste.jogador_atual == BRANCO:
-         print("\nCalculando movimento inicial para Brancas...")
-         start_time = time.time()
-         movimento_escolhido = ia_teste.encontrar_melhor_movimento(
-             partida_teste,
-             BRANCO,
-             partida_teste.movimentos_legais_atuais
-         )
-         end_time = time.time()
-         print(f"\n[Teste] Tempo de cálculo: {end_time - start_time:.2f}s")
-         if movimento_escolhido: print(f"[Teste] Movimento Sugerido: {ia_teste._formatar_movimento(movimento_escolhido)}")
-         else: print("[Teste] IA não encontrou movimento.")
-         
-         # Salvar estatísticas em um arquivo separado
-         with open("stats_ia.txt", "w") as f:
-             f.write("=== ESTATÍSTICAS DA IA ===\n")
-             f.write(f"Profundidade Máxima Configurada: {ia_teste.profundidade_maxima}\n")
-             f.write(f"Profundidade Completada: {ia_teste.profundidade_completa}\n")
-             f.write(f"Profundidade Real Atingida: {ia_teste.profundidade_real_atingida}\n")
-             f.write(f"Nós Visitados (Minimax): {ia_teste.nos_visitados}\n")
-             f.write(f"Nós Visitados (Quiescence): {ia_teste.nos_quiescence_visitados}\n")
-             f.write(f"Total de Nós: {ia_teste.nos_visitados + ia_teste.nos_quiescence_visitados}\n")
-             f.write(f"TT Hits: {ia_teste.tt_hits}\n")
-             f.write(f"Podas Alpha: {ia_teste.podas_alpha}\n")
-             f.write(f"Podas Beta: {ia_teste.podas_beta}\n")
-             f.write(f"Tempo Total: {end_time - start_time:.2f}s\n")
-             f.write(f"Nós por segundo: {(ia_teste.nos_visitados + ia_teste.nos_quiescence_visitados) / max(0.001, end_time - start_time):.0f}\n")
-             f.write("\nTempo por Nível de Profundidade:\n")
-             for nivel, tempo in sorted(ia_teste.tempo_por_nivel.items()):
-                 f.write(f"  - Nível {nivel}: {tempo:.4f}s\n")
-     print("\n--- Fim do Teste ---")
+    print("--- Testando damas_logic.py v12.3 Iterative Deepening + Time Management ---")
+    partida_teste = Partida(jogador_branco="IA", jogador_preto="Humano")
+    print(f"Profundidade Máxima de Teste: {PROFUNDIDADE_IA}, Tempo Limite: {TEMPO_PADRAO_IA}s")
+    print("Estado Inicial:"); print(partida_teste.tabuleiro)
+    if partida_teste.jogador_atual == BRANCO:
+        print("\n[COM LMR] Calculando movimento inicial para Brancas...")
+        ia_lmr = MotorIA(profundidade=PROFUNDIDADE_IA, tempo_limite=TEMPO_PADRAO_IA, debug_heur=True, usar_lmr=True)
+        start_time_lmr = time.time()
+        mov_lmr = ia_lmr.encontrar_melhor_movimento(
+            partida_teste,
+            BRANCO,
+            partida_teste.movimentos_legais_atuais
+        )
+        end_time_lmr = time.time()
+        print(f"\n[COM LMR] Tempo de cálculo: {end_time_lmr - start_time_lmr:.2f}s")
+        if mov_lmr: print(f"[COM LMR] Movimento Sugerido: {ia_lmr._formatar_movimento(mov_lmr)}")
+        else: print("[COM LMR] IA não encontrou movimento.")
+        print(f"[COM LMR] Nós Visitados (Minimax): {ia_lmr.nos_visitados}")
+        print(f"[COM LMR] Nós Visitados (Quiescence): {ia_lmr.nos_quiescence_visitados}")
+        print(f"[COM LMR] Profundidade Completada: {ia_lmr.profundidade_completa}")
+        print(f"[COM LMR] Profundidade Real Atingida: {ia_lmr.profundidade_real_atingida}")
+        print(f"[COM LMR] TT Hits: {ia_lmr.tt_hits}")
+        print(f"[COM LMR] Podas Alpha: {ia_lmr.podas_alpha}")
+        print(f"[COM LMR] Podas Beta: {ia_lmr.podas_beta}")
+        print(f"[COM LMR] Nós por segundo: {(ia_lmr.nos_visitados + ia_lmr.nos_quiescence_visitados) / max(0.001, end_time_lmr - start_time_lmr):.0f}")
 
-     # Testar avaliação de heurística
-     tabuleiro = partida_teste.tabuleiro
-     print("\n[DEBUG] Avaliação heurística para BRANCO:")
-     tabuleiro.avaliar_heuristica(BRANCO, debug_aval=True)
-     print("\n[DEBUG] Avaliação heurística para PRETO:")
-     tabuleiro.avaliar_heuristica(PRETO, debug_aval=True)
-    
-     ia = MotorIA(profundidade=12, tempo_limite=25.0, debug_heur=True)
+        print("\n[SEM LMR] Calculando movimento inicial para Brancas...")
+        ia_nolmr = MotorIA(profundidade=PROFUNDIDADE_IA, tempo_limite=TEMPO_PADRAO_IA, debug_heur=True, usar_lmr=False)
+        start_time_nolmr = time.time()
+        mov_nolmr = ia_nolmr.encontrar_melhor_movimento(
+            partida_teste,
+            BRANCO,
+            partida_teste.movimentos_legais_atuais
+        )
+        end_time_nolmr = time.time()
+        print(f"\n[SEM LMR] Tempo de cálculo: {end_time_nolmr - start_time_nolmr:.2f}s")
+        if mov_nolmr: print(f"[SEM LMR] Movimento Sugerido: {ia_nolmr._formatar_movimento(mov_nolmr)}")
+        else: print("[SEM LMR] IA não encontrou movimento.")
+        print(f"[SEM LMR] Nós Visitados (Minimax): {ia_nolmr.nos_visitados}")
+        print(f"[SEM LMR] Nós Visitados (Quiescence): {ia_nolmr.nos_quiescence_visitados}")
+        print(f"[SEM LMR] Profundidade Completada: {ia_nolmr.profundidade_completa}")
+        print(f"[SEM LMR] Profundidade Real Atingida: {ia_nolmr.profundidade_real_atingida}")
+        print(f"[SEM LMR] TT Hits: {ia_nolmr.tt_hits}")
+        print(f"[SEM LMR] Podas Alpha: {ia_nolmr.podas_alpha}")
+        print(f"[SEM LMR] Podas Beta: {ia_nolmr.podas_beta}")
+        print(f"[SEM LMR] Nós por segundo: {(ia_nolmr.nos_visitados + ia_nolmr.nos_quiescence_visitados) / max(0.001, end_time_nolmr - start_time_nolmr):.0f}")
+
+        print("\n=== COMPARATIVO LMR x SEM LMR ===")
+        print(f"Tempo (LMR): {end_time_lmr - start_time_lmr:.2f}s | (SEM LMR): {end_time_nolmr - start_time_nolmr:.2f}s")
+        print(f"Nós (LMR): {ia_lmr.nos_visitados} | (SEM LMR): {ia_nolmr.nos_visitados}")
+        print(f"Quiescence (LMR): {ia_lmr.nos_quiescence_visitados} | (SEM LMR): {ia_nolmr.nos_quiescence_visitados}")
+        print(f"Profundidade Completada (LMR): {ia_lmr.profundidade_completa} | (SEM LMR): {ia_nolmr.profundidade_completa}")
+        print(f"Movimento Sugerido (LMR): {ia_lmr._formatar_movimento(mov_lmr)} | (SEM LMR): {ia_nolmr._formatar_movimento(mov_nolmr)}")
+        print(f"Score final (LMR): {ia_lmr.melhor_score_prev:.2f} | (SEM LMR): {ia_nolmr.melhor_score_prev:.2f}")
+    print("\n--- Fim do Teste ---")
     
