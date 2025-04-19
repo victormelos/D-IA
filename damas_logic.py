@@ -1225,11 +1225,17 @@ class MotorIA:
             if i % 8 == 0 and self.verificar_tempo():
                 raise TempoExcedidoError("Tempo excedido durante minimax")
             is_capture = len(tab.identificar_pecas_capturadas(mov)) > 0
+            _, dest = mov[0], mov[-1]
+            p_type = Peca.get_tipo(tab.get_peca(dest))
+            cor_mov = Peca.get_cor(tab.get_peca(dest))
+            is_promo = (p_type == PEDRA and tab.chegou_para_promover(dest, cor_mov))
+            extension = 2 if is_promo else (1 if is_capture else 0)
+            next_prof = prof - 1 + extension
             static_eval = tab.avaliar_heuristica(cor_ia)
             # --- Principal Variation Search (PVS) ---
             if i == 0:
                 # PV move: busca full-window
-                score = -self.minimax(tab, cont_emp, prof-1, -beta, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                score = -self.minimax(tab, cont_emp, next_prof, -beta, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
             else:
                 # LMR só em não-PV, não-captura, heurística fria
                 do_lmr = self.lmr_reduction(prof, i) > 0 and not is_capture and static_eval + LMR_MARGIN <= alpha
@@ -1237,17 +1243,17 @@ class MotorIA:
                     self.lmr_attempts += 1
                     R_lmr = self.lmr_reduction(prof, i)
                     # pesquisa rasa adaptativa, zero-window
-                    score = -self.minimax(tab, cont_emp, prof-1-R_lmr, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                    score = -self.minimax(tab, cont_emp, next_prof-R_lmr, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
                     if score > alpha:
                         self.lmr_recalls += 1
                         # pesquisa normal completa, zero-window
-                        score = -self.minimax(tab, cont_emp, prof-1, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                        score = -self.minimax(tab, cont_emp, next_prof, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
                 else:
                     # Zero-window search
-                    score = -self.minimax(tab, cont_emp, prof-1, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                    score = -self.minimax(tab, cont_emp, next_prof, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
                 # Se passar alpha, relance full-window
                 if score > alpha:
-                    score = -self.minimax(tab, cont_emp, prof-1, -beta, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                    score = -self.minimax(tab, cont_emp, next_prof, -beta, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
 
             if score > melhor_val:
                 melhor_val = score
@@ -1299,18 +1305,23 @@ class MotorIA:
         self.nos_quiescence_visitados += 1
         stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=False)
         mov_caps = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
+        # Cache local para capturas e peça de origem
+        capturadas_cache = {m: tab.identificar_pecas_capturadas(m) for m in mov_caps}
+        peca_origem_cache = {m: tab.get_peca(m[0]) for m in mov_caps}
         # Ordenação híbrida MVV/LVA + SEE para capturas na quiescence
         mov_caps.sort(
             key=lambda m: (
-                max(abs(v) for v in tab.identificar_pecas_capturadas(m).values()) if tab.identificar_pecas_capturadas(m) else 0,
-                -abs(tab.get_peca(m[0]))
+                max(abs(v) for v in capturadas_cache[m].values()) if capturadas_cache[m] else 0,
+                -abs(peca_origem_cache[m])
             ),
             reverse=True
         )
         K = 4
         top_k = mov_caps[:K]
         rest = mov_caps[K:]
-        top_k.sort(key=lambda m: self.see(tab, m[-1], jog_q), reverse=True)
+        # Cache para SEE (opcional, mas recomendado se top_k for grande)
+        see_cache = {m: self.see(tab, m[-1], jog_q) for m in top_k}
+        top_k.sort(key=lambda m: see_cache[m], reverse=True)
         mov_caps = top_k + rest
         # SEE completo para cortes
         def see_gain(tab, mov, jog_q):
