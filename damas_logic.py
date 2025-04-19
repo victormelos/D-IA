@@ -187,8 +187,8 @@ class Tabuleiro:
             if depth > 900 and not getattr(self, '_depth_warning_emitted', False):
                 logging.warning(f"Alerta de profundidade (Tabuleiro): {depth}")
                 self._depth_warning_emitted = True
-        # uma dama recém‐promovida não pode capturar neste mesmo turno
-        if pos_a in self.damas_recem_promovidas:
+        # dama recém‐promovida não captura **ao iniciar** o salto
+        if depth == 0 and pos_a in self.damas_recem_promovidas:
             return []
         # --- se chegou à última linha como pedra, para na promoção: não captura mais ---
         if tipo == PEDRA and self.chegou_para_promover(pos_a, cor):
@@ -317,6 +317,8 @@ class Tabuleiro:
 
     def _fazer_lance(self, mov: Movimento, troca_turno: bool = True) -> EstadoLanceDesfazer:
         self.limpar_cache_capturas()
+        if hasattr(self, '_cache_ameaca_2l'):
+            self._cache_ameaca_2l.clear()
         o=mov[0]; d=mov[-1]; h_a=self.hash_atual; p_o=self.get_peca(o); c=Peca.get_cor(p_o); t_o=Peca.get_tipo(p_o)
         pc=self.identificar_pecas_capturadas(mov); self.mover_peca(o,d);
         for pos_c in pc: self.remover_peca(pos_c)
@@ -745,6 +747,11 @@ class Tabuleiro:
         Retorna True se a peça em (r, c) pode ser capturada em até 2 lances do adversário,
         considerando que o próprio jogador pode responder entre os lances do oponente.
         """
+        if not hasattr(self, '_cache_ameaca_2l'):
+            self._cache_ameaca_2l = {}
+        key = (self.hash_atual, r, c)
+        if key in self._cache_ameaca_2l:
+            return self._cache_ameaca_2l[key]
         cor_peca = Peca.get_cor(self.grid[r][c])
         if cor_peca == VAZIO:
             return False
@@ -761,8 +768,12 @@ class Tabuleiro:
                 for mov2 in tab_temp2.encontrar_movimentos_possiveis(cor_oponente):
                     capturas2 = tab_temp2.identificar_pecas_capturadas(mov2)
                     if (r, c) in capturas2:
-                        return True
-        return False
+                        result = True
+                        self._cache_ameaca_2l[key] = result
+                        return result
+        result = False
+        self._cache_ameaca_2l[key] = result
+        return result
 
     def material_balance(self, cor_ref: int) -> float:
         """
@@ -920,6 +931,10 @@ class MotorIA:
         self.history_heuristic.clear(); self.null_cuts = 0; self.null_attempts = 0
         self.lmr_attempts = 0; self.lmr_recalls = 0
         self.tempo_acabou = False
+        # *** reset de estatísticas de poda e tempo por nível ***
+        self.podas_alpha = 0
+        self.podas_beta  = 0
+        self.tempo_por_nivel = {}
 
     def _formatar_movimento(self, mov: Movimento) -> str: return " -> ".join([Tabuleiro.pos_para_alg(p) for p in mov]) if mov else "N/A"
     def _mov_para_chave_history(self, mov: Movimento) -> Optional[Tuple[Posicao, Posicao]]: return (mov[0], mov[-1]) if mov and len(mov) >= 2 else None
@@ -1118,6 +1133,7 @@ class MotorIA:
             tab._atualizar_hash_turno()
             if score >= beta:
                 self.null_cuts += 1
+                self.podas_beta += 1
                 return beta
 
         movs = tab.encontrar_movimentos_possiveis(jog)
@@ -1127,7 +1143,11 @@ class MotorIA:
             if not has_forcing_moves:
                 margin = self.futility_margin(prof)
                 static = tab.avaliar_heuristica(cor_ia)
+                movs_antes = len(movs)
                 movs = [m for m in movs if len(tab.identificar_pecas_capturadas(m)) > 0 or static + margin > alpha]
+                # Se descartamos movimentos, contamos como poda alpha
+                if len(movs) < movs_antes:
+                    self.podas_alpha += 1
 
         # Ordenação: TT, killer, captures, history
         movs_ordenados = []
@@ -1172,6 +1192,7 @@ class MotorIA:
                     beta_cut_count += 1
                     if beta_cut_count >= K:
                         self.multicuts_cut += 1
+                        self.podas_beta += 1
                         return beta
 
         melhor_val = -float('inf'); a_orig = alpha
@@ -1216,6 +1237,7 @@ class MotorIA:
             alpha = max(alpha, melhor_val)
             if beta <= alpha:
                 # Atualiza killer moves no beta-cut
+                self.podas_beta += 1
                 if kd >= 0 and kd < len(self.killer_moves):
                     if mov not in self.killer_moves[kd]:
                         self.killer_moves[kd][1] = self.killer_moves[kd][0]
@@ -1279,12 +1301,15 @@ class MotorIA:
                 return valor
             max_gain = max(valor_captura(m) for m in mov_caps)
             if stand_pat + max_gain <= a:
+                self.podas_alpha += 1
                 return stand_pat
         if prof_q <= 0: return stand_pat
         is_max = (jog_q == cor_ia)
         if is_max: a = max(a, stand_pat)
         else: b = min(b, stand_pat)
-        if b <= a: return stand_pat
+        if b <= a: 
+            self.podas_beta += 1
+            return stand_pat
         if not mov_caps: return stand_pat
         score_final_q = stand_pat
         if is_max:
@@ -1308,7 +1333,9 @@ class MotorIA:
                 val = self.quiescence_search(tab, prox_prof_q, a, b, prox_jog, cor_ia, depth=depth+1)
                 tab._desfazer_lance(estado_d)
                 score_final_q = max(score_final_q, val); a = max(a, score_final_q)
-                if b <= a: break
+                if b <= a: 
+                    self.podas_beta += 1
+                    break
         else:
             for mov in mov_caps:
                 # SEE pruning completo
@@ -1330,7 +1357,9 @@ class MotorIA:
                 val = self.quiescence_search(tab, prox_prof_q, a, b, prox_jog, cor_ia, depth=depth+1)
                 tab._desfazer_lance(estado_d)
                 score_final_q = min(score_final_q, val); b = min(b, score_final_q)
-                if b <= a: break
+                if b <= a: 
+                    self.podas_beta += 1
+                    break
         return score_final_q
 
     def obter_estatisticas_aspiration(self):
