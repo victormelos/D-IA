@@ -82,6 +82,9 @@ MAX_QUIESCENCE_DEPTH = 5 # Reduzido para enxugar a busca de quiescência
 TT_TAMANHO_MB = 128; TT_ENTRIES = (TT_TAMANHO_MB * 1024 * 1024) // 32
 TT_FLAG_EXACT = 0; TT_FLAG_LOWERBOUND = 1; TT_FLAG_UPPERBOUND = 2
 
+# Adicione no início do arquivo, junto das outras constantes globais:
+MAX_PROFUNDIDADE_TOTAL = 64  # Limite absoluto para evitar RecursionError
+
 # --- Tipos e Estruturas Auxiliares ---
 Posicao = Tuple[int, int]; Movimento = List[Posicao]
 class EstadoLanceDesfazer(NamedTuple):
@@ -1224,18 +1227,46 @@ class MotorIA:
             # Checagem de tempo periódica (agora a cada 8 movimentos)
             if i % 8 == 0 and self.verificar_tempo():
                 raise TempoExcedidoError("Tempo excedido durante minimax")
-            is_capture = len(tab.identificar_pecas_capturadas(mov)) > 0
-            _, dest = mov[0], mov[-1]
-            p_type = Peca.get_tipo(tab.get_peca(dest))
-            cor_mov = Peca.get_cor(tab.get_peca(dest))
-            is_promo = (p_type == PEDRA and tab.chegou_para_promover(dest, cor_mov))
+            # 2.1) detecta se houve captura e se ainda há combo possível
+            caps_origem = tab.identificar_pecas_capturadas(mov)
+            continuacoes = []
+            if caps_origem:
+                continuacoes = tab._encontrar_capturas_recursivo(
+                    mov[-1],
+                    jog,                              # o jogador atual
+                    Peca.get_tipo(tab.get_peca(mov[-1])),
+                    [mov[-1]], []
+                )
+            # 2.2) só troca de turno se NÃO tiver combo
+            troca = not (caps_origem and continuacoes)
+            # 2.3) faz o lance usando a flag certa
+            estado = tab._fazer_lance(mov, troca_turno=troca)
+
+            # --- Recalcula extensão a partir do zero ---
+            is_promo = (Peca.get_tipo(tab.get_peca(mov[-1])) == PEDRA and tab.chegou_para_promover(mov[-1], jog))
+            is_capture = bool(caps_origem)
             extension = 2 if is_promo else (1 if is_capture else 0)
+            # Extensão tática: dupla-ameaça
+            # caps_ia = tab.encontrar_movimentos_possiveis(self.cor_ia, apenas_capturas=True)
+            # if len(caps_ia) >= 3:  # ajuste esse número conforme desejado
+            #     extension += 1
+            # Bloqueio total do oponente
+            # movs_op = tab.encontrar_movimentos_possiveis(Tabuleiro.get_oponente(jog))
+            # if not movs_op:
+            #     extension += 2
+            # elif len(movs_op) <= 2:
+            #     extension += 1
+            # Log de depuração das extensões
+            logging.debug(f"[EXT] mov={self._formatar_movimento(mov)} ext={extension}")
+
+            # Ajusta profundidade
             next_prof = prof - 1 + extension
-            static_eval = tab.avaliar_heuristica(cor_ia)
+            next_prof = max(0, min(next_prof, self.profundidade_maxima))
+            static_eval = tab.avaliar_heuristica(self.cor_ia)
             # --- Principal Variation Search (PVS) ---
             if i == 0:
                 # PV move: busca full-window
-                score = -self.minimax(tab, cont_emp, next_prof, -beta, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                score = -self.minimax(tab, cont_emp, next_prof, -beta, -alpha, Tabuleiro.get_oponente(jog), self.cor_ia, depth=depth+1)
             else:
                 # LMR só em não-PV, não-captura, heurística fria
                 do_lmr = self.lmr_reduction(prof, i) > 0 and not is_capture and static_eval + LMR_MARGIN <= alpha
@@ -1243,17 +1274,19 @@ class MotorIA:
                     self.lmr_attempts += 1
                     R_lmr = self.lmr_reduction(prof, i)
                     # pesquisa rasa adaptativa, zero-window
-                    score = -self.minimax(tab, cont_emp, next_prof-R_lmr, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                    score = -self.minimax(tab, cont_emp, next_prof-R_lmr, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), self.cor_ia, depth=depth+1)
                     if score > alpha:
                         self.lmr_recalls += 1
                         # pesquisa normal completa, zero-window
-                        score = -self.minimax(tab, cont_emp, next_prof, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                        score = -self.minimax(tab, cont_emp, next_prof, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), self.cor_ia, depth=depth+1)
                 else:
                     # Zero-window search
-                    score = -self.minimax(tab, cont_emp, next_prof, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                    score = -self.minimax(tab, cont_emp, next_prof, -alpha-1, -alpha, Tabuleiro.get_oponente(jog), self.cor_ia, depth=depth+1)
                 # Se passar alpha, relance full-window
                 if score > alpha:
-                    score = -self.minimax(tab, cont_emp, next_prof, -beta, -alpha, Tabuleiro.get_oponente(jog), cor_ia, depth=depth+1)
+                    score = -self.minimax(tab, cont_emp, next_prof, -beta, -alpha, Tabuleiro.get_oponente(jog), self.cor_ia, depth=depth+1)
+            # Desfaz o lance
+            tab._desfazer_lance(estado)
 
             if score > melhor_val:
                 melhor_val = score
@@ -1306,13 +1339,13 @@ class MotorIA:
         stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=False)
         mov_caps = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
         # Cache local para capturas e peça de origem
-        capturadas_cache = {m: tab.identificar_pecas_capturadas(m) for m in mov_caps}
-        peca_origem_cache = {m: tab.get_peca(m[0]) for m in mov_caps}
+        capturadas_cache = {tuple(m): tab.identificar_pecas_capturadas(m) for m in mov_caps}
+        peca_origem_cache = {tuple(m): tab.get_peca(m[0]) for m in mov_caps}
         # Ordenação híbrida MVV/LVA + SEE para capturas na quiescence
         mov_caps.sort(
             key=lambda m: (
-                max(abs(v) for v in capturadas_cache[m].values()) if capturadas_cache[m] else 0,
-                -abs(peca_origem_cache[m])
+                max(abs(v) for v in capturadas_cache[tuple(m)].values()) if capturadas_cache[tuple(m)] else 0,
+                -abs(peca_origem_cache[tuple(m)])
             ),
             reverse=True
         )
@@ -1320,8 +1353,8 @@ class MotorIA:
         top_k = mov_caps[:K]
         rest = mov_caps[K:]
         # Cache para SEE (opcional, mas recomendado se top_k for grande)
-        see_cache = {m: self.see(tab, m[-1], jog_q) for m in top_k}
-        top_k.sort(key=lambda m: see_cache[m], reverse=True)
+        see_cache = {tuple(m): self.see(tab, m[-1], jog_q) for m in top_k}
+        top_k.sort(key=lambda m: see_cache[tuple(m)], reverse=True)
         mov_caps = top_k + rest
         # SEE completo para cortes
         def see_gain(tab, mov, jog_q):
@@ -1375,7 +1408,12 @@ class MotorIA:
                 else:
                     prox_prof_q = prof_q - 1
                     prox_jog = Tabuleiro.get_oponente(jog_q)
-                val = self.quiescence_search(tab, prox_prof_q, a, b, prox_jog, cor_ia, depth=depth+1)
+                # Extensão para combos (captura múltipla)
+                is_combo = len(tab.identificar_pecas_capturadas(mov)) > 1
+                ext = 1 if is_combo else 0
+                next_q = prox_prof_q + ext
+                next_q = min(next_q, MAX_QUIESCENCE_DEPTH)  # Proteção contra profundidade excessiva
+                val = self.quiescence_search(tab, next_q, a, b, prox_jog, cor_ia, depth=depth+1)
                 tab._desfazer_lance(estado_d)
                 score_final_q = max(score_final_q, val); a = max(a, score_final_q)
                 if b <= a: 
@@ -1399,7 +1437,12 @@ class MotorIA:
                 else:
                     prox_prof_q = prof_q - 1
                     prox_jog = Tabuleiro.get_oponente(jog_q)
-                val = self.quiescence_search(tab, prox_prof_q, a, b, prox_jog, cor_ia, depth=depth+1)
+                # Extensão para combos (captura múltipla)
+                is_combo = len(tab.identificar_pecas_capturadas(mov)) > 1
+                ext = 1 if is_combo else 0
+                next_q = prox_prof_q + ext
+                next_q = min(next_q, MAX_QUIESCENCE_DEPTH)  # Proteção contra profundidade excessiva
+                val = self.quiescence_search(tab, next_q, a, b, prox_jog, cor_ia, depth=depth+1)
                 tab._desfazer_lance(estado_d)
                 score_final_q = min(score_final_q, val); b = min(b, score_final_q)
                 if b <= a: 
