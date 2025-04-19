@@ -550,9 +550,13 @@ class Tabuleiro:
         tab_temp = self.criar_copia()
         cor_op = Tabuleiro.get_oponente(cor_ref)
         caps = tab_temp.encontrar_movimentos_possiveis(cor_op, apenas_capturas=True)
-        valor_caps = sum(VALOR_DAMA if abs(self.get_peca(m[0]))==DAMA else VALOR_PEDRA for m in caps)
+        # soma valor das vítimas (última casa de cada movimento)
+        valor_caps = 0.0
+        for m in caps:
+            v = tab_temp.get_peca(m[-1])
+            valor_caps += (VALOR_DAMA if abs(v)==DAMA else VALOR_PEDRA)
+        bonus += -valor_caps
         if valor_caps > 0:
-            bonus += -valor_caps
             if debug:
                 debug_info.append({
                     'pos': None, 'tipo':'PÊNALTI TÁTICO',
