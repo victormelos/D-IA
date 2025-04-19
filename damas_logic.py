@@ -993,18 +993,26 @@ class MotorIA:
                 # Ordenação raiz para esta profundidade
                 mov_caps_raiz = [m for m in movimentos_legais if len(tab_copia.identificar_pecas_capturadas(m)) > 0]
                 mov_simples_raiz = [m for m in movimentos_legais if m not in mov_caps_raiz]
-                # Ordenar capturas por MVV/LVA (valor capturado, depois atacante)
-                def valor_captura_mvv_lva(m):
-                    capturadas = tab_copia.identificar_pecas_capturadas(m)
-                    if not capturadas:
-                        return (0, 0)
-                    valor_capt = max(abs(v) for v in capturadas.values())  # Mais valiosa vítima
-                    atacante = abs(tab_copia.get_peca(m[0]))
-                    # DAMA=2, PEDRA=1, então menor é melhor para LVA
-                    return (valor_capt, -atacante)
-                mov_caps_raiz = sorted(mov_caps_raiz, key=valor_captura_mvv_lva, reverse=True)
+
+                # 1) MVV/LVA: custo zero, já joga as "boas" lá no topo
+                mov_caps_raiz.sort(
+                    key=lambda m: (
+                        max(abs(v) for v in tab_copia.identificar_pecas_capturadas(m).values()), 
+                        -abs(tab_copia.get_peca(m[0]))
+                    ), 
+                    reverse=True
+                )
+
+                # 2) SEE: refina ainda mais as K melhores
+                K = 4
+                top_k = mov_caps_raiz[:K]
+                rest  = mov_caps_raiz[K:]
+                top_k.sort(key=lambda m: self.see(tab_copia, m[-1], cor_ia), reverse=True)
+
+                mov_caps_raiz = top_k + rest
                 mov_simples_raiz.sort(key=lambda m: self.history_heuristic.get(self._mov_para_chave_history(m), 0), reverse=True)
                 movs_ord_raiz = mov_caps_raiz + mov_simples_raiz
+
                 # Usar último melhor movimento primeiro (se existir e não for captura)
                 if self.melhor_movimento_atual in movs_ord_raiz:
                     movs_ord_raiz.remove(self.melhor_movimento_atual)
@@ -1166,7 +1174,20 @@ class MotorIA:
                     movs.remove(kmov)
         movs_ordenados.extend(killer_list)
         mov_caps = [m for m in movs if len(tab.identificar_pecas_capturadas(m)) > 0]
-        mov_caps.sort(key=lambda m: sum(abs(v) for v in tab.identificar_pecas_capturadas(m).values()), reverse=True)
+        # MVV/LVA
+        mov_caps.sort(
+            key=lambda m: (
+                max(abs(v) for v in tab.identificar_pecas_capturadas(m).values()), 
+                -abs(tab.get_peca(m[0]))
+            ), 
+            reverse=True
+        )
+        # SEE refine
+        K = 4
+        top_k = mov_caps[:K]
+        rest  = mov_caps[K:]
+        top_k.sort(key=lambda m: self.see(tab, m[-1], self.cor_ia), reverse=True)
+        mov_caps = top_k + rest
         mov_nao_caps = [m for m in movs if m not in mov_caps]
         mov_nao_caps.sort(key=lambda m: self.history_heuristic.get((m[0], m[-1]), 0), reverse=True)
         movs_ordenados.extend(mov_caps)
@@ -1278,6 +1299,19 @@ class MotorIA:
         self.nos_quiescence_visitados += 1
         stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=False)
         mov_caps = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
+        # Ordenação híbrida MVV/LVA + SEE para capturas na quiescence
+        mov_caps.sort(
+            key=lambda m: (
+                max(abs(v) for v in tab.identificar_pecas_capturadas(m).values()) if tab.identificar_pecas_capturadas(m) else 0,
+                -abs(tab.get_peca(m[0]))
+            ),
+            reverse=True
+        )
+        K = 4
+        top_k = mov_caps[:K]
+        rest = mov_caps[K:]
+        top_k.sort(key=lambda m: self.see(tab, m[-1], jog_q), reverse=True)
+        mov_caps = top_k + rest
         # SEE completo para cortes
         def see_gain(tab, mov, jog_q):
             pos = mov[-1]
