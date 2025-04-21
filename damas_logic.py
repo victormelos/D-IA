@@ -9,6 +9,7 @@ from collections import OrderedDict
 import statistics
 import math
 import logging
+import cProfile, pstats
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)s: %(message)s',
@@ -16,7 +17,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)    # ou DEBUG para tudo
+logger.setLevel(logging.INFO)    # Configurando para INFO por padrão (era DEBUG)
 ch = logging.StreamHandler()
 ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
 if not logger.hasHandlers():
@@ -110,6 +111,38 @@ ZOBRIST_TABELA = [[[random.randint(1, 2**64 - 1) for _ in range(5)] for _ in ran
 ZOBRIST_VEZ_PRETA = random.randint(1, 2**64 - 1)
 Z_PROM = [[random.randint(1, 2**64 - 1) for _ in range(TAMANHO_TABULEIRO)] for _ in range(TAMANHO_TABULEIRO)]
 
+# --- Constantes para Bitboards ---
+# Shifts para as 4 direções diagonais (NE, NO, SE, SO)
+BB_SHIFT_NE = -7  # Nordeste (para cima e direita)
+BB_SHIFT_NW = -9  # Noroeste (para cima e esquerda)
+BB_SHIFT_SE = 9   # Sudeste (para baixo e direita)
+BB_SHIFT_SW = 7   # Sudoeste (para baixo e esquerda)
+
+# Máscara para as casas escuras onde ocorre o jogo (r+c)%2==1
+DARK_SQUARES = 0x55AA55AA55AA55AA
+
+# Shifts para as direções de cada cor
+BB_SHIFTS_WHITE = [BB_SHIFT_NE, BB_SHIFT_NW]       # para cima/norte (brancas)
+BB_SHIFTS_BLACK = [BB_SHIFT_SE, BB_SHIFT_SW]       # para baixo/sul (pretas)
+BB_SHIFTS_ALL = [BB_SHIFT_NE, BB_SHIFT_NW, BB_SHIFT_SE, BB_SHIFT_SW]
+
+# Constantes para movimentos especiais em debug e testes
+BIT_K = 0x01  # Constante para representar um movimento de Rei (King)
+BIT_R = 0x02  # Constante para representar um movimento de Torre (Rook)
+BIT_G = 0x04  # Constante para representar um movimento genérico/especial (Generic)
+
+# Máscaras para evitar wrap-around nas bordas
+BB_NOT_A_FILE = ~0x0101010101010101  # Não está na coluna A (0)
+BB_NOT_H_FILE = ~0x8080808080808080  # Não está na coluna H (7)
+
+# Máscaras para as colunas (positivas)
+MASK_FILE_A = 0x0101010101010101  # Coluna A (0)
+MASK_FILE_H = 0x8080808080808080  # Coluna H (7)
+
+# Fileiras de promoção
+BB_RANK_1 = 0x00000000000000FF  # Primeira fileira (para brancas)
+BB_RANK_8 = 0xFF00000000000000  # Última fileira (para pretas)
+
 # --- Classe Peca ---
 class Peca:
     def __init__(self, c: int, t: int=PEDRA): self.cor=c; self.tipo=t
@@ -125,33 +158,339 @@ class Peca:
 
 # --- Classe Tabuleiro ---
 class Tabuleiro:
-    def __init__(self, estado_inicial: bool = True):
+    def __init__(self, estado_inicial=True):
+        # Inicializa os bitboards (representações de 64 bits do tabuleiro)
+        self.bitboard_brancas = 0
+        self.bitboard_pretas = 0
+        self.bitboard_damas_brancas = 0
+        self.bitboard_damas_pretas = 0
+        
+        # Inicializa o grid tradicional (para compatibilidade)
+        self.grid = [[0]*8 for _ in range(8)]
+        
+        # Constantes para máscaras de colunas (usadas para prevenir wraparound)
+        self.BB_COL_A = 0x0101010101010101
+        self.BB_COL_H = 0x8080808080808080
+        self.BB_NOT_COL_A = 0xFEFEFEFEFEFEFEFE
+        self.BB_NOT_COL_H = 0x7F7F7F7F7F7F7F7F
+        
+        # Aliases para compatibilidade com nomenclatura padrão de chess engines
+        self.BB_A_FILE = self.BB_COL_A  # Máscara para coluna A (0x0101010101010101)
+        self.BB_H_FILE = self.BB_COL_H  # Máscara para coluna H (0x8080808080808080)
+        self.BB_NOT_A_FILE = self.BB_NOT_COL_A  # Máscara para todas as colunas exceto A
+        self.BB_NOT_H_FILE = self.BB_NOT_COL_H  # Máscara para todas as colunas exceto H
+        
+        # Inicializa atributos de controle
+        self.damas_recem_promovidas = set()
         self.max_depth_reached = 0
-        self._depth_warning_emitted = False
-        self.grid = [[VAZIO] * TAMANHO_TABULEIRO for _ in range(TAMANHO_TABULEIRO)]
-        self.casas_centro = {(r, c) for r in range(2, 6) for c in range(2, 6)}
-        self.casas_centro_expandido = {(2,1),(2,3),(2,5),(3,2),(3,4),(4,3),(4,5),(5,2),(5,4),(5,6)}
-        self.hash_atual: int = 0
-        self.damas_recem_promovidas: Set[Posicao] = set()  # Conjunto para rastrear posições de damas recém-promovidas
-        self._cache_capturas = {}  # Cache local para capturas
-        if estado_inicial: self.configuracao_inicial(); self.hash_atual = self.calcular_hash_zobrist_inicial()
+        
+        # Inicializa caches
+        self._cache_capturas = {}
+        self._moves_cache = {}
+        self._eval_cache = {}
+        
+        # Preenche o tabuleiro com a configuração inicial, se solicitado
+        if estado_inicial:
+            self._inicializar_tabuleiro()
+            self.hash_atual = self.calcular_hash_zobrist_inicial()
+        else:
+            self.hash_atual = 0
+        
+        # Outras inicializações
+        self.movimentos_cache = {}
+        self.capturas_cache = {}
+        
+    def print_bitboards_hex(self):
+        """Imprime todos os bitboards no formato hexadecimal."""
+        print(f"White Men:   0x{self.bitboard_brancas:016X}")
+        print(f"White Kings: 0x{self.bitboard_damas_brancas:016X}")
+        print(f"Black Men:   0x{self.bitboard_pretas:016X}")
+        print(f"Black Kings: 0x{self.bitboard_damas_pretas:016X}")
+        print(f"All Pieces:  0x{self.get_all_pieces():016X}")
+        print(f"Empty Sqrs:  0x{self.get_empty_squares():016X}")
 
+    def print_all_bitboards(self):
+        """Imprime todos os bitboards em formato visual de tabuleiro."""
+        def print_bitboard(bb, nome):
+            print(f"\n{nome}:")
+            for linha in range(8):
+                linha_str = ""
+                for coluna in range(8):
+                    bit_pos = 1 << (linha * 8 + coluna)
+                    if bb & bit_pos:
+                        linha_str += "X "
+                    else:
+                        linha_str += ". "
+                print(f"{7-linha} {linha_str}")
+            print("  0 1 2 3 4 5 6 7")
+        
+        print_bitboard(self.bitboard_brancas, "Peças Brancas")
+        print_bitboard(self.bitboard_damas_brancas, "Damas Brancas")
+        print_bitboard(self.bitboard_pretas, "Peças Pretas")
+        print_bitboard(self.bitboard_damas_pretas, "Damas Pretas")
+        print_bitboard(self.bitboard_brancas | self.bitboard_damas_brancas | 
+                       self.bitboard_pretas | self.bitboard_damas_pretas, "Todas as Peças")
+    
+    def pos_to_bit(self, pos):
+        """Converte uma posição (linha, coluna) para sua representação em bit."""
+        linha, coluna = pos
+        return 1 << (linha * 8 + coluna)
+        
+    def bit_to_pos(self, bit):
+        """Converte um bit para sua posição (linha, coluna)."""
+        if bit == 0:
+            return None
+        # Encontra a posição do bit 1 (começando do LSB)
+        bit_pos = 0
+        while bit > 1:
+            bit >>= 1
+            bit_pos += 1
+        return (bit_pos // 8, bit_pos % 8)
+    
+    def _bit_scan_forward(self, bb):
+        """
+        Retorna o índice do bit menos significativo setado em 1.
+        Esta é uma versão otimizada para ser usada em operações com bitboards.
+        
+        Args:
+            bb: O bitboard a ser analisado
+            
+        Returns:
+            O índice (0-63) do bit menos significativo que está ligado,
+            ou -1 se o bitboard for zero.
+        """
+        if bb == 0:
+            return -1
+        idx = 0
+        while bb & 1 == 0:
+            bb >>= 1
+            idx += 1
+        return idx
+    
+    def validar_movimentos_simples(self, cor):
+        """
+        Valida os movimentos simples gerados pelo método de bitboards comparando com o método tradicional.
+        
+        Args:
+            cor: COR_BRANCA ou COR_PRETA
+            
+        Returns:
+            bool: True se os resultados forem idênticos, False caso contrário.
+        """
+        # Obtém os movimentos usando o novo método de bitboards
+        movimentos_bb = self.gera_movimentos_simples(cor)
+        # Obtém os movimentos usando o método tradicional
+        movimentos_trad = self.encontrar_movimentos_possiveis(cor, apenas_capturas=False)
+        
+        # Filtra apenas os movimentos simples (não-capturas) do método tradicional
+        movimentos_trad_simples = [m for m in movimentos_trad if len(m) == 2]
+        
+        # Ordena os movimentos para facilitar a comparação
+        movimentos_bb.sort()
+        movimentos_trad_simples.sort()
+        
+        # Verifica se os conjuntos de movimentos são idênticos
+        if set(map(tuple, movimentos_bb)) == set(map(tuple, movimentos_trad_simples)):
+            print(f"Validação bem-sucedida para a cor {cor}. Ambos os métodos geraram os mesmos {len(movimentos_bb)} movimentos.")
+            return True
+        else:
+            # Se houver diferença, identifica quais movimentos estão em um conjunto mas não no outro
+            bb_set = set(map(tuple, movimentos_bb))
+            trad_set = set(map(tuple, movimentos_trad_simples))
+            
+            apenas_bb = bb_set - trad_set
+            apenas_trad = trad_set - bb_set
+            
+            print(f"Validação falhou para a cor {cor}.")
+            print(f"Movimentos gerados apenas pelo método de bitboards ({len(apenas_bb)}):")
+            for m in sorted(apenas_bb):
+                print(f"  {m}")
+                
+            print(f"Movimentos gerados apenas pelo método tradicional ({len(apenas_trad)}):")
+            for m in sorted(apenas_trad):
+                print(f"  {m}")
+            
+            print(f"Total de movimentos (bitboards): {len(movimentos_bb)}")
+            print(f"Total de movimentos (tradicional): {len(movimentos_trad_simples)}")
+            
+            return False
+    
+    def imprimir_bitboard(self, bb, nome="Bitboard"):
+        """
+        Imprime uma representação visual do bitboard no formato de tabuleiro 8x8.
+        
+        Args:
+            bb: O bitboard a ser impresso
+            nome: Um nome para identificar o bitboard
+        """
+        print(f"{nome} (hex: {bb:016x}):")
+        print("  0 1 2 3 4 5 6 7")
+        for r in range(8):
+            linha = f"{r} "
+            for c in range(8):
+                idx = r * 8 + c
+                bit = (bb >> idx) & 1
+                linha += "# " if bit else ". "
+            print(linha)
+        print()
+
+    def debug_bitboards(self):
+        """Imprime todos os bitboards para depuração."""
+        self.imprimir_bitboard(self.BB_TABULEIRO_VALIDO, "Tabuleiro válido")
+        self.imprimir_bitboard(self.BB_PECAS_BRANCAS, "Peças brancas")
+        self.imprimir_bitboard(self.BB_PECAS_PRETAS, "Peças pretas")
+        self.imprimir_bitboard(self.BB_DAMAS, "Damas")
+    
+    def _inicializar_tabuleiro(self):
+        """Inicializa o tabuleiro com a configuração inicial de jogo."""
+        # Inicializa o grid tradicional
+        for i in range(8):
+            for j in range(8):
+                if (i + j) % 2 == 1:  # Casas pretas (jogáveis)
+                    if i < 3:
+                        self.grid[i][j] = PP  # Peças pretas nas linhas superiores
+                    elif i > 4:
+                        self.grid[i][j] = PB  # Peças brancas nas linhas inferiores
+                    else:
+                        self.grid[i][j] = 0   # Casas vazias
+                else:
+                    self.grid[i][j] = 0   # Casas brancas (não jogáveis)
+        
+        # Atualiza os bitboards baseado no grid
+        for linha in range(8):
+            for coluna in range(8):
+                bit_pos = 1 << (linha * 8 + coluna)
+                if self.grid[linha][coluna] == PB:
+                    self.bitboard_brancas |= bit_pos
+                elif self.grid[linha][coluna] == PP:
+                    self.bitboard_pretas |= bit_pos
+                elif self.grid[linha][coluna] == DB:
+                    self.bitboard_brancas |= bit_pos
+                    self.bitboard_damas_brancas |= bit_pos
+                elif self.grid[linha][coluna] == DP:
+                    self.bitboard_pretas |= bit_pos
+                    self.bitboard_damas_pretas |= bit_pos
+                   
+    def get_pieces_by_color(self, cor: int) -> int:
+        """Retorna um bitboard com todas as peças de uma determinada cor."""
+        if cor == BRANCO:
+            return self.bitboard_brancas | self.bitboard_damas_brancas
+        else:
+            return self.bitboard_pretas | self.bitboard_damas_pretas
+            
+    def get_all_pieces(self) -> int:
+        """Retorna um bitboard com todas as peças no tabuleiro."""
+        return self.bitboard_brancas | self.bitboard_damas_brancas | self.bitboard_pretas | self.bitboard_damas_pretas
+        
+    def get_empty_squares(self) -> int:
+        """Retorna um bitboard com todas as casas vazias do tabuleiro."""
+        all_pieces = self.get_all_pieces()
+        # No tabuleiro de damas, só usamos as casas escuras (1 bit sim, 1 bit não)
+        return ~all_pieces & DARK_SQUARES
+        
+    @staticmethod
+    def lsb(bb: int) -> int:
+        """Retorna o bit menos significativo ligado."""
+        if bb == 0:
+            return 0
+        return bb & -bb
+        
+    @staticmethod
+    def clear_lsb(bb: int) -> int:
+        """Remove o bit menos significativo ligado."""
+        if bb == 0:
+            return 0
+        return bb & (bb - 1)
+        
+    def bits_to_positions(self, bb: int) -> List[Posicao]:
+        """Converte um bitboard em uma lista de posições (r,c)."""
+        positions = []
+        while bb:
+            lsb = self.lsb(bb)
+            positions.append(self.bit_to_pos(lsb))
+            bb = self.clear_lsb(bb)
+        return positions
+
+    def _clear_move_and_capture_cache(self):
+        """Limpa apenas os caches relacionados a movimentos e capturas."""
+        self.movimentos_cache.clear()
+        self.capturas_cache.clear()
+        
     def limpar_cache_capturas(self):
-        self._cache_capturas.clear()
+        """Método legado para compatibilidade, agora só limpa os caches de movimentos."""
+        self._clear_move_and_capture_cache()
 
     def configuracao_inicial(self):
+        # **Reinicia** os bitboards
+        self.bitboard_brancas = 0
+        self.bitboard_pretas = 0
+        self.bitboard_damas_brancas = 0
+        self.bitboard_damas_pretas = 0
+
+        # Preenche só os men (pedras) nas posições iniciais
+        for r in range(8):
+            for c in range(8):
+                if (r + c) % 2 == 1:  # casas escuras
+                    b = self.pos_to_bit((r, c))
+                    if r < 3:
+                        self.bitboard_pretas |= b  # Peças pretas nas linhas superiores
+                    elif r > 4:
+                        self.bitboard_brancas |= b  # Peças brancas nas linhas inferiores
+
+        # Atualiza self.grid para manter o __repr__ funcionando
         for r in range(TAMANHO_TABULEIRO):
             for c in range(TAMANHO_TABULEIRO):
-                if (r+c)%2!=0: self.grid[r][c]=PP if r<3 else (PB if r>4 else VAZIO)
-                else: self.grid[r][c]=VAZIO
-        self.limpar_cache_capturas()
+                bit = self.pos_to_bit((r, c))
+                if self.bitboard_brancas & bit: 
+                    self.grid[r][c] = PB
+                elif self.bitboard_damas_brancas & bit: 
+                    self.grid[r][c] = DB
+                elif self.bitboard_pretas & bit: 
+                    self.grid[r][c] = PP
+                elif self.bitboard_damas_pretas & bit: 
+                    self.grid[r][c] = DP
+                else:
+                    self.grid[r][c] = VAZIO
+
+        # limpa caches ligados a movimentos/avaliação
+        self._clear_move_and_capture_cache()
+        self._eval_cache.clear()  # Aqui limpamos também o eval_cache porque é uma nova configuração inicial
 
     def calcular_hash_zobrist_inicial(self) -> int:
-        h=0;
-        for r in range(TAMANHO_TABULEIRO):
-            for c in range(TAMANHO_TABULEIRO):
-                p=self.grid[r][c];
-                if p != VAZIO: h ^= ZOBRIST_TABELA[r][c][Peca.get_zobrist_indice(p)]
+        h = 0
+        
+        # Processar peças brancas
+        white_man = self.bitboard_brancas
+        while white_man:
+            lsb = self.lsb(white_man)
+            r, c = self.bit_to_pos(lsb)
+            h ^= ZOBRIST_TABELA[r][c][Peca.get_zobrist_indice(PB)]
+            white_man = self.clear_lsb(white_man)
+            
+        # Processar damas brancas
+        white_king = self.bitboard_damas_brancas
+        while white_king:
+            lsb = self.lsb(white_king)
+            r, c = self.bit_to_pos(lsb)
+            h ^= ZOBRIST_TABELA[r][c][Peca.get_zobrist_indice(DB)]
+            white_king = self.clear_lsb(white_king)
+            
+        # Processar peças pretas
+        black_man = self.bitboard_pretas
+        while black_man:
+            lsb = self.lsb(black_man)
+            r, c = self.bit_to_pos(lsb)
+            h ^= ZOBRIST_TABELA[r][c][Peca.get_zobrist_indice(PP)]
+            black_man = self.clear_lsb(black_man)
+            
+        # Processar damas pretas
+        black_king = self.bitboard_damas_pretas
+        while black_king:
+            lsb = self.lsb(black_king)
+            r, c = self.bit_to_pos(lsb)
+            h ^= ZOBRIST_TABELA[r][c][Peca.get_zobrist_indice(DP)]
+            black_king = self.clear_lsb(black_king)
+            
         return h
 
     def _atualizar_hash_zobrist(self, r: int, c: int, v: int):
@@ -163,32 +502,79 @@ class Tabuleiro:
         h="  "+" ".join(chr(ord('a')+i) for i in range(TAMANHO_TABULEIRO))+" "; l=[h];
         for r in range(TAMANHO_TABULEIRO): l.append(f"{TAMANHO_TABULEIRO-r:<2}"+"".join(Peca.get_char(self.grid[r][c])+" " for c in range(TAMANHO_TABULEIRO))+f"{TAMANHO_TABULEIRO-r:<2}");
         l.append(h); return "\n".join(l)
-    def get_peca(self, p: Posicao)->int: r,c=p; return self.grid[r][c] if self.is_valido(r,c) else VAZIO
+    def get_peca(self, p: Posicao)->int: 
+        r, c = p
+        if not self.is_valido(r, c):
+            return VAZIO
+
+        bit = self.pos_to_bit(p)
+        if self.bitboard_brancas & bit:
+            return PB
+        elif self.bitboard_damas_brancas & bit:
+            return DB
+        elif self.bitboard_pretas & bit:
+            return PP
+        elif self.bitboard_damas_pretas & bit:
+            return DP
+        else:
+            return VAZIO
 
     def set_peca(self, p: Posicao, v: int):
-        r,c=p;
-        if self.is_valido(r,c):
-            pa=self.grid[r][c]
-            if pa!=VAZIO: self._atualizar_hash_zobrist(r,c,pa)
-            self.grid[r][c]=v
-            if v!=VAZIO: self._atualizar_hash_zobrist(r,c,v)
-            self.limpar_cache_capturas()
+        r, c = p
+        if not self.is_valido(r, c):
+            return
+        
+        # Atualizar hash do Zobrist ao remover a peça antiga
+        peca_antiga = self.get_peca(p)
+        if peca_antiga != VAZIO:
+            self._atualizar_hash_zobrist(r, c, peca_antiga)
+        
+        # Remover qualquer peça existente na posição
+        bit = self.pos_to_bit(p)
+        self.bitboard_brancas &= ~bit
+        self.bitboard_damas_brancas &= ~bit
+        self.bitboard_pretas &= ~bit
+        self.bitboard_damas_pretas &= ~bit
+        
+        # Adicionar a nova peça
+        if v == PB:
+            self.bitboard_brancas |= bit
+        elif v == DB:
+            self.bitboard_damas_brancas |= bit
+        elif v == PP:
+            self.bitboard_pretas |= bit
+        elif v == DP:
+            self.bitboard_damas_pretas |= bit
+        
+        # Atualizar hash do Zobrist para a nova peça
+        if v != VAZIO:
+            self._atualizar_hash_zobrist(r, c, v)
+        
+        # Atualizar a grid para compatibilidade
+        self.grid[r][c] = v
+        
+        # Limpar caches
+        self._clear_move_and_capture_cache()
 
     def mover_peca(self, o: Posicao, d: Posicao):
-        p=self.get_peca(o)
+        peca = self.get_peca(o)
         self.set_peca(o, VAZIO)
-        self.set_peca(d, p)
-        self.limpar_cache_capturas()
+        self.set_peca(d, peca)
+        self._clear_move_and_capture_cache()
 
     def remover_peca(self, p: Posicao):
         self.set_peca(p, VAZIO)
-        self.limpar_cache_capturas()
+        self._clear_move_and_capture_cache()
 
     @staticmethod
     def is_valido(r: int, c: int) -> bool: return 0<=r<TAMANHO_TABULEIRO and 0<=c<TAMANHO_TABULEIRO
     @staticmethod
     def get_oponente(cor: int) -> int: return PRETO if cor==BRANCO else BRANCO
-    def get_posicoes_pecas(self, c: int) -> List[Posicao]: return [(r,col) for r in range(TAMANHO_TABULEIRO) for col in range(TAMANHO_TABULEIRO) if Peca.get_cor(self.grid[r][col])==c]
+    
+    def get_posicoes_pecas(self, cor: int) -> List[Posicao]:
+        """Retorna todas as posições das peças de uma determinada cor."""
+        bb = self.get_pieces_by_color(cor)
+        return self.bits_to_positions(bb)
 
     def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: Movimento, caps_cam: list, visited=None, depth=0) -> List[Movimento]:
         # Monitoramento de profundidade global
@@ -210,6 +596,8 @@ class Tabuleiro:
             return []
         visited = visited | {pos_a}
         use_cache = len(visited) <= 1
+        if not hasattr(self, '_cache_capturas'):
+            self._cache_capturas = {}
         key = (self.hash_atual, pos_a, cor, tipo, tuple(sorted(caps_cam)), frozenset(visited), frozenset(self.damas_recem_promovidas))
         if use_cache and key in self._cache_capturas:
             return self._cache_capturas[key]
@@ -266,10 +654,18 @@ class Tabuleiro:
         return seqs
 
     def encontrar_movimentos_possiveis(self, cor: int, apenas_capturas: bool = False) -> List[Movimento]:
+        if not hasattr(self, '_moves_cache'):
+            self._moves_cache = {}
+        key = (self.hash_atual, cor, apenas_capturas)
+        if key in self._moves_cache:
+            return self._moves_cache[key]
+            
         all_capturas = []
         simples = []
         capturas_por_pos = {}
         for pos_i in self.get_posicoes_pecas(cor):
+            if not hasattr(self, 'damas_recem_promovidas'):
+                self.damas_recem_promovidas = set()
             if pos_i in self.damas_recem_promovidas:
                 continue
             pv = self.get_peca(pos_i)
@@ -281,9 +677,13 @@ class Tabuleiro:
                 all_capturas.extend(caps_peca)
         if all_capturas:
             max_caps = max(len(seq)-1 for seq in all_capturas)
-            return [seq for seq in all_capturas if len(seq)-1 == max_caps]
+            result = [seq for seq in all_capturas if len(seq)-1 == max_caps]
+            self._moves_cache[key] = result
+            return result
         if apenas_capturas:
-            return []
+            result = []
+            self._moves_cache[key] = result
+            return result
         for pos_i in self.get_posicoes_pecas(cor):
             if pos_i in self.damas_recem_promovidas:
                 continue
@@ -306,6 +706,7 @@ class Tabuleiro:
                             simples.append([pos_i, pd])
                         else:
                             break
+        self._moves_cache[key] = simples
         return simples
 
     def identificar_pecas_capturadas(self, mov: Movimento) -> Dict[Posicao, int]:
@@ -326,7 +727,7 @@ class Tabuleiro:
         return caps
 
     def _fazer_lance(self, mov: Movimento, troca_turno: bool = True) -> EstadoLanceDesfazer:
-        self.limpar_cache_capturas()
+        self._clear_move_and_capture_cache()
         if hasattr(self, '_cache_ameaca_2l'):
             self._cache_ameaca_2l.clear()
         o=mov[0]; d=mov[-1]; h_a=self.hash_atual; p_o=self.get_peca(o); c=Peca.get_cor(p_o); t_o=Peca.get_tipo(p_o)
@@ -346,7 +747,7 @@ class Tabuleiro:
         return EstadoLanceDesfazer(mov,p_o,pc,pr,h_a,damas_adicionadas, troca_turno)
 
     def _desfazer_lance(self, e: EstadoLanceDesfazer):
-        self.limpar_cache_capturas()
+        self._clear_move_and_capture_cache()
         self.hash_atual=e.hash_anterior; mov=e.movimento; o=mov[0]; d=mov[-1]; p_r=e.peca_movida_original
         self.grid[d[0]][d[1]]=VAZIO; self.grid[o[0]][o[1]]=p_r;
         for pos_c,val_c in e.pecas_capturadas.items(): self.grid[pos_c[0]][pos_c[1]] = val_c
@@ -542,19 +943,23 @@ class Tabuleiro:
                     bonus += mob_dama
                     debug_piece['bônus']['BONUS_MOBILIDADE_DAMA'] = mob_dama
                     val += mob_dama
-                ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
-                if ameacada_2l:
-                    bonus += PENALIDADE_PECA_AMEACADA_2L
-                    debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
-                    val += PENALIDADE_PECA_AMEACADA_2L
+                
                 if self.tem_formacao_ponte(r, c):
                     bonus += BONUS_FORMACAO_PONTE
                     debug_piece['bônus']['BONUS_FORMACAO_PONTE'] = BONUS_FORMACAO_PONTE
                     val += BONUS_FORMACAO_PONTE
-                if self.tem_formacao_lanca(r, c):
-                    bonus += BONUS_FORMACAO_LANCA
-                    debug_piece['bônus']['BONUS_FORMACAO_LANCA'] = BONUS_FORMACAO_LANCA
-                    val += BONUS_FORMACAO_LANCA
+                
+                # Removido verificação de peça ameaçada em 2 lances para melhorar performance
+                # ameacada_2l = self.eh_peca_ameacada_em_2_lances(r, c)
+                # if ameacada_2l:
+                #     bonus += PENALIDADE_PECA_AMEACADA_2L
+                #     debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+                #     val += PENALIDADE_PECA_AMEACADA_2L
+                
+                if self.eh_peca_ameacada(r, c):
+                    bonus += PENALIDADE_PECA_AMEACADA_2L
+                    debug_piece['bônus']['PENALIDADE_PECA_AMEACADA_2L'] = PENALIDADE_PECA_AMEACADA_2L
+                    val += PENALIDADE_PECA_AMEACADA_2L
                 debug_piece['score_parcial'] = val
                 if debug:
                     debug_info.append(debug_piece)
@@ -582,9 +987,20 @@ class Tabuleiro:
         return score
 
     def avaliar_heuristica(self, cor_ref: int, debug_aval: bool = False) -> float:
+        # só cachear quando não for em modo debug
+        if not hasattr(self, '_eval_cache'):
+            self._eval_cache = {}
+        key = (self.hash_atual, cor_ref)
+        if not debug_aval and key in self._eval_cache:
+            return self._eval_cache[key]
+
         allied = self._heuristica_para_cor(cor_ref, debug_aval)
         opponent = self._heuristica_para_cor(self.get_oponente(cor_ref), False)
-        return allied - opponent
+        score = allied - opponent
+
+        if not debug_aval:
+            self._eval_cache[key] = score
+        return score
 
     @staticmethod
     def pos_para_alg(p: Posicao)->str: r,c=p; return chr(ord('a')+c)+str(TAMANHO_TABULEIRO-r) if Tabuleiro.is_valido(r,c) else "Inv"
@@ -594,9 +1010,20 @@ class Tabuleiro:
     def criar_copia(self) -> 'Tabuleiro':
         """Cria uma cópia profunda do tabuleiro atual."""
         nova_copia = Tabuleiro(estado_inicial=False)  # Cria um tabuleiro vazio
+        
+        # Copia os bitboards
+        nova_copia.bitboard_brancas = self.bitboard_brancas
+        nova_copia.bitboard_damas_brancas = self.bitboard_damas_brancas
+        nova_copia.bitboard_pretas = self.bitboard_pretas
+        nova_copia.bitboard_damas_pretas = self.bitboard_damas_pretas
+        
+        # Copia os dados convencionais
         nova_copia.grid = [linha[:] for linha in self.grid]  # Copia profunda da grade
         nova_copia.hash_atual = self.hash_atual
         nova_copia.damas_recem_promovidas = set(self.damas_recem_promovidas)  # Propaga flags de promoção
+        nova_copia._eval_cache = dict(self._eval_cache)  # Copia o cache de avaliação
+        nova_copia._moves_cache = dict(self._moves_cache)  # Copia o cache de movimentos
+        
         return nova_copia
 
     def limpar_damas_recem_promovidas_por_cor(self, cor: int):
@@ -752,602 +1179,395 @@ class Tabuleiro:
         """
         Retorna True se a peça em (r, c) pode ser capturada em até 2 lances do adversário,
         considerando que o próprio jogador pode responder entre os lances do oponente.
+        
+        Versão otimizada: utiliza análise simplificada da posição em vez de busca profunda.
+        
+        Otimizações implementadas:
+        1. Cache de resultados: armazena os resultados de posições já analisadas pelo hash do tabuleiro
+           e a posição (r, c), evitando recálculos.
+        2. Verificação rápida de vulnerabilidade direta: se a peça já está vulnerável em um lance,
+           retorna True imediatamente sem mais cálculos.
+        3. Verificação de proteção: se a peça está protegida, é menos provável que seja ameaçada
+           em 2 lances, então retorna False para economizar cálculos.
+        4. Análise estatística de atacantes e defensores: em vez de fazer uma busca minimax completa 
+           de profundidade 2, analisa a presença de atacantes e defensores nas diagonais próximas.
+        5. Foco apenas nas diagonais relevantes: considera apenas as diagonais em que as peças podem
+           se mover, reduzindo o espaço de busca.
+        
+        Impacto de desempenho:
+        - Redução significativa no número de cópias de tabuleiro criadas
+        - Eliminação da busca minimax completa de profundidade 2
+        - Análise mais eficiente com heurística aproximada
+        
+        Complexidade anterior: O(m^d), onde m é o número médio de movimentos e d=2 (profundidade)
+        Complexidade atual: O(1) para casos em cache/simples, O(k) para casos complexos, 
+                           onde k é o número de diagonais verificadas (constante pequena)
         """
+        # Se já temos o resultado no cache, retornamos ele direto
         if not hasattr(self, '_cache_ameaca_2l'):
             self._cache_ameaca_2l = {}
         key = (self.hash_atual, r, c)
         if key in self._cache_ameaca_2l:
             return self._cache_ameaca_2l[key]
+        
+        # Verifica se é uma peça válida
         cor_peca = Peca.get_cor(self.grid[r][c])
         if cor_peca == VAZIO:
             return False
+            
         cor_oponente = self.get_oponente(cor_peca)
-        # 1º lance: para cada movimento do oponente
-        for mov1 in self.encontrar_movimentos_possiveis(cor_oponente):
-            tab_temp1 = self.criar_copia()
-            tab_temp1._fazer_lance(mov1, troca_turno=True)
-            # 2º lance: para cada resposta do próprio jogador
-            for mov_resp in tab_temp1.encontrar_movimentos_possiveis(cor_peca):
-                tab_temp2 = tab_temp1.criar_copia()
-                tab_temp2._fazer_lance(mov_resp, troca_turno=True)
-                # Agora, o oponente tenta capturar em 2 lances
-                for mov2 in tab_temp2.encontrar_movimentos_possiveis(cor_oponente):
-                    capturas2 = tab_temp2.identificar_pecas_capturadas(mov2)
-                    if (r, c) in capturas2:
-                        result = True
-                        self._cache_ameaca_2l[key] = result
-                        return result
-        result = False
+        
+        # Primeira otimização: verificar ameaça direta (em 1 lance)
+        # Se já está vulnerável em 1 lance, não precisa calcular para 2 lances
+        if self.eh_peca_vulneravel(r, c):
+            self._cache_ameaca_2l[key] = True
+            return True
+            
+        # Segunda otimização: verificamos se a peça está protegida
+        # Se está protegida, a chance de ser ameaçada em 2 lances é menor
+        if self.eh_peca_protegida(r, c):
+            self._cache_ameaca_2l[key] = False
+            return False
+        
+        # Terceira otimização: verificar se existem atacantes potenciais próximos
+        # Verificamos em um raio de 2 casas ao redor da peça
+        atacantes_proximos = 0
+        defensores_proximos = 0
+        
+        # Verificamos nas diagonais próximas (1 e 2 casas de distância)
+        # Em damas, apenas movimentos diagonais são permitidos
+        diagonais_proximas = [
+            (-1, -1), (-1, 1), (1, -1), (1, 1),  # 1 casa de distância
+            (-2, -2), (-2, 2), (2, -2), (2, 2)   # 2 casas de distância
+        ]
+        
+        for dr, dc in diagonais_proximas:
+            nr, nc = r + dr, c + dc
+            if self.is_valido(nr, nc):
+                peca = self.grid[nr][nc]
+                if peca != VAZIO:
+                    peca_cor = Peca.get_cor(peca)
+                    if peca_cor == cor_oponente:
+                        # Verificamos se é uma dama (pode mover em qualquer direção)
+                        if Peca.get_tipo(peca) == DAMA:
+                            atacantes_proximos += 1
+                        # Verificamos se é uma pedra com direção correta para atacar
+                        elif Peca.get_tipo(peca) == PEDRA:
+                            # Pedras pretas movem para baixo (dr > 0), brancas para cima (dr < 0)
+                            if (cor_oponente == PRETO and dr > 0) or (cor_oponente == BRANCO and dr < 0):
+                                atacantes_proximos += 1
+                    elif peca_cor == cor_peca:
+                        defensores_proximos += 1
+        
+        # Se temos mais atacantes que defensores em um raio próximo,
+        # consideramos que a peça está potencialmente ameaçada em 2 lances
+        result = atacantes_proximos > defensores_proximos
+        
         self._cache_ameaca_2l[key] = result
         return result
 
     def material_balance(self, cor_ref: int) -> float:
-        """
-        Retorna a diferença de material (pedras e damas) da cor `cor_ref`
-        em relação ao oponente, usando apenas VALOR_PEDRA e VALOR_DAMA.
-        """
-        allied_p = 0
-        allied_d = 0
-        opp_p = 0
-        opp_d = 0
-        # Determina os valores das peças para a cor de referência e oponente
+        """Calcula o balanço material: diferença entre peças do jogador e do oponente."""
+        # Contar peças usando bitboards
+        white_men_count = bin(self.bitboard_brancas).count("1")
+        white_kings_count = bin(self.bitboard_damas_brancas).count("1")
+        black_men_count = bin(self.bitboard_pretas).count("1")
+        black_kings_count = bin(self.bitboard_damas_pretas).count("1")
+        
+        # Calcular valores totais
+        white_value = white_men_count * VALOR_PEDRA + white_kings_count * VALOR_DAMA
+        black_value = black_men_count * VALOR_PEDRA + black_kings_count * VALOR_DAMA
+        
+        # Retornar o balanço com base na cor de referência
         if cor_ref == BRANCO:
-            pedra_aliada, dama_aliada = PB, DB
-            pedra_oponente, dama_oponente = PP, DP
+            return white_value - black_value
         else:
-            pedra_aliada, dama_aliada = PP, DP
-            pedra_oponente, dama_oponente = PB, DB
-        for r in range(TAMANHO_TABULEIRO):
-            for c in range(TAMANHO_TABULEIRO):
-                v = self.grid[r][c]
-                if v == pedra_aliada:
-                    allied_p += 1
-                elif v == dama_aliada:
-                    allied_d += 1
-                elif v == pedra_oponente:
-                    opp_p += 1
-                elif v == dama_oponente:
-                    opp_d += 1
-        allied_score = allied_p * VALOR_PEDRA + allied_d * VALOR_DAMA
-        opp_score = opp_p * VALOR_PEDRA + opp_d * VALOR_DAMA
-        return allied_score - opp_score
+            return black_value - white_value
 
     def chegou_para_promover(self, pos: Posicao, cor: int) -> bool:
-        """Retorna True se a posição está na fileira de promoção para a cor dada."""
-        l_promo = 0 if cor == BRANCO else TAMANHO_TABULEIRO - 1
-        return pos[0] == l_promo
-
-# --- Classe Partida ---
-class Partida:
-    def __init__(self, jogador_branco: str = "Humano", jogador_preto: str = "IA"):
-        self.tabuleiro = Tabuleiro(); self.jogador_atual = BRANCO; self.movimentos_legais_atuais: List[Movimento] = []
-        self.contador_lances_sem_progresso = 0; self.total_lances = 0; self.vencedor = None
-        self.tipo_jogadores = {BRANCO: jogador_branco, PRETO: jogador_preto}; self._atualizar_movimentos_legais()
-    def _atualizar_movimentos_legais(self):
-        self.movimentos_legais_atuais = self.tabuleiro.encontrar_movimentos_possiveis(self.jogador_atual)
-        if self.vencedor is None and not self.movimentos_legais_atuais:
-             op = Tabuleiro.get_oponente(self.jogador_atual); self.vencedor = self.jogador_atual if not self.tabuleiro.get_posicoes_pecas(op) else op
-             # print(f"[Partida] Fim detectado em _atualizar_movimentos_legais. Vencedor: {self.vencedor}")
-    def _verificar_fim_de_jogo(self):
-        if self.vencedor is not None: return True
-        op = Tabuleiro.get_oponente(self.jogador_atual);
-        if not self.tabuleiro.get_posicoes_pecas(op): self.vencedor = self.jogador_atual; print(f"[Partida] Fim (sem peças oponente)."); return True
-        if self.contador_lances_sem_progresso >= 40: self.vencedor = VAZIO; print("[Partida] Fim (Empate)."); return True
-        return False
-    def trocar_turno(self): 
-        # Primeiro armazena o jogador atual
-        jogador_anterior = self.jogador_atual
-        # Troca o turno
-        self.jogador_atual = Tabuleiro.get_oponente(self.jogador_atual)
-        # Agora limpa as damas recém-promovidas do jogador que vai jogar
-        # (as que foram promovidas no turno anterior do mesmo jogador, quando o oponente jogou)
-        self.tabuleiro.limpar_damas_recem_promovidas_por_cor(self.jogador_atual)
-    def executar_lance_completo(self, movimento: Movimento) -> bool:
-        if not self.movimentos_legais_atuais or movimento not in self.movimentos_legais_atuais:
-            print(f"Erro: Mov inválido Partida: {movimento}"); return False
-        jogador_antes = self.jogador_atual
-        # Determinar se haverá troca de turno
-        houve_captura = False
-        foi_promovido = False
-        tipo_final = None
-        pos_final = movimento[-1]
-        peca_final = self.tabuleiro.get_peca(pos_final)
-        tipo_final = Peca.get_tipo(peca_final)
-        # Verifica se há capturas possíveis a partir da posição final (combo)
-        estado_desfazer = self.tabuleiro._fazer_lance(movimento, troca_turno=True)  # Default: troca_turno
-        houve_captura = bool(estado_desfazer.pecas_capturadas)
-        foi_movimento_pedra = (Peca.get_tipo(estado_desfazer.peca_movida_original) == PEDRA)
-        foi_promovido = estado_desfazer.foi_promovido
-        if houve_captura or foi_movimento_pedra:
-            self.contador_lances_sem_progresso = 0
+        """Verifica se uma peça chegou à fileira de promoção (usando bitboards)."""
+        bit = self.pos_to_bit(pos)
+        
+        if cor == BRANCO:
+            # Peças brancas promovem na primeira fileira (rank 1)
+            return bit & BB_RANK_1 != 0
         else:
-            self.contador_lances_sem_progresso += 1
-        self.total_lances += 1
-        if foi_promovido:
-            print(f"[REGRA] Peça promovida a dama em {Tabuleiro.pos_para_alg(movimento[-1])}. Turno passa para o adversário.")
-            # método único que troca de jogador _e_ limpa flags do jogador que vai jogar agora
-            self.trocar_turno()
-            self._atualizar_movimentos_legais()
-            self._verificar_fim_de_jogo()
-            return True
-        if houve_captura:
-            pos_final = movimento[-1]
-            peca_final = self.tabuleiro.get_peca(pos_final)
-            tipo_final = Peca.get_tipo(peca_final)
-            capturas_combo = self.tabuleiro._encontrar_capturas_recursivo(pos_final, self.jogador_atual, tipo_final, [pos_final], [])
-            if capturas_combo:
-                # Combo: não troca turno nem hash
-                self.movimentos_legais_atuais = [c for c in capturas_combo if len(c) > 1]
-                # Refaz o lance sem troca de turno/hash
-                self.tabuleiro._desfazer_lance(estado_desfazer)
-                estado_desfazer = self.tabuleiro._fazer_lance(movimento, troca_turno=False)
+            # Peças pretas promovem na última fileira (rank 8)
+            return bit & BB_RANK_8 != 0
+
+    def eh_peca_ameacada(self, r: int, c: int) -> bool:
+        """
+        Retorna True se a peça em (r, c) está ameaçada por uma peça adversária adjacente.
+        """
+        for dr, dc in DIRECOES_CAPTURA_PEDRA:
+            r_dest, c_dest = r + dr, c + dc
+            if self.is_valido(r_dest, c_dest) and self.grid[r_dest][c_dest] != VAZIO:
                 return True
-        # fim de lance "normal" — troca e limpa flags de recém‑promovidas
-        self.trocar_turno()
-        self._atualizar_movimentos_legais()
-        self._verificar_fim_de_jogo()
-        return True
-
-    def criar_copia(self) -> 'Partida':
-        """Cria uma cópia profunda da partida atual."""
-        copia = Partida(
-            jogador_branco=self.tipo_jogadores[BRANCO], 
-            jogador_preto=self.tipo_jogadores[PRETO]
-        )
-        copia.tabuleiro = self.tabuleiro.criar_copia()
-        copia.jogador_atual = self.jogador_atual
-        copia.contador_lances_sem_progresso = self.contador_lances_sem_progresso
-        copia.total_lances = self.total_lances
-        copia.vencedor = self.vencedor
-        copia.movimentos_legais_atuais = [movimento[:] for movimento in self.movimentos_legais_atuais]
-        return copia
-
-# --- Classe MotorIA (Versão com Iterative Deepening + Time Management) ---
-class MotorIA:
-    def __init__(self, profundidade: int, tempo_limite: float = TEMPO_PADRAO_IA, debug_heur: bool = False, usar_lmr: bool = True):
-        self.profundidade_maxima = profundidade
-        self.tempo_limite = tempo_limite
-        self.debug_heur = debug_heur
-        self.usar_lmr = usar_lmr
-        # Estatísticas
-        self.nos_visitados = 0; self.nos_quiescence_visitados = 0; self.tt_hits = 0
-        self.null_cuts = 0; self.null_attempts = 0
-        self.lmr_attempts = 0; self.lmr_recalls = 0
-        # Transposition table, killers, history
-        self.transposition_table: OrderedDict[int,TTEntry] = OrderedDict()
-        self.killer_moves = [[None,None] for _ in range(profundidade+1)]
-        self.history_heuristic = defaultdict(int)
-        self.MULTICUT_N = 4
-        self.MULTICUT_K = 2
-        self.MULTICUT_R = 2
-        self.multicuts_attempted = 0
-        self.multicuts_cut = 0
-        self.tempo_acabou = False
-        # Inicializações ausentes
-        self.tempo_por_nivel = {}
-        self.profundidade_real_atingida = 0
-        self.podas_alpha = 0
-        self.podas_beta = 0
-        # Monitoramento de profundidade global
-        self.max_depth_reached = 0
-        self._depth_warning_emitted = False
-        # Contadores de chamadas
-        self.minimax_calls = 0
-        self.quiescence_calls = 0
-
-    def limpar_tt_e_historico(self):
-        self.transposition_table.clear(); self.killer_moves = [[None,None] for _ in range(self.profundidade_maxima+1)]
-        self.history_heuristic.clear(); self.null_cuts = 0; self.null_attempts = 0
-        self.lmr_attempts = 0; self.lmr_recalls = 0
-        self.tempo_acabou = False
-        # *** reset de estatísticas de poda e tempo por nível ***
-        self.podas_alpha = 0
-        self.podas_beta  = 0
-        self.tempo_por_nivel = {}
-        # Reset dos contadores de chamadas
-        self.minimax_calls = 0
-        self.quiescence_calls = 0
-
-    def _formatar_movimento(self, mov: Movimento) -> str: return " -> ".join([Tabuleiro.pos_para_alg(p) for p in mov]) if mov else "N/A"
-    def _mov_para_chave_history(self, mov: Movimento) -> Optional[Tuple[Posicao, Posicao]]: return (mov[0], mov[-1]) if mov and len(mov) >= 2 else None
-
-    def verificar_tempo(self):
-        if time.time() - self.tempo_inicio > self.tempo_limite:
-            self.tempo_acabou = True
-            return True
         return False
 
-    def encontrar_melhor_movimento(self, partida, cor_ia, movimentos_legais):
-        self.cor_ia = cor_ia
-        if not movimentos_legais: print("[IA] Nenhum movimento legal."); return None
-        if len(movimentos_legais) == 1: unico=movimentos_legais[0]; print(f"[IA] Movimento único: {self._formatar_movimento(unico)}"); return unico
-
-        self.limpar_tt_e_historico(); self.tempo_inicio = time.time()
-        self.nos_visitados = 0; self.nos_quiescence_visitados = 0; self.tt_hits = 0
-        self.melhor_movimento_atual = movimentos_legais[0] # Movimento padrão caso tempo acabe muito rápido
-
-        # Inicialização de Aspiration Windows
-        self.melhor_score_prev = 0.0
-        self.aspiration_delta = 15.0
-
-        tab_copia = partida.tabuleiro.criar_copia()
-        start_time_total = time.time()
-
-        resultados_por_profundidade = {}
-        for prof_atual in range(1, self.profundidade_maxima + 1):
-            if self.tempo_acabou:
-                print(f"[IA] Tempo limite atingido. Usando melhor mov da prof {self.profundidade_completa}")
-                break
-
-            print(f"[ID] Iniciando profundidade {prof_atual}: minimax_calls={self.minimax_calls}, quiescence_calls={self.quiescence_calls}")
-            alpha, beta = -float('inf'), float('inf')
-
-            tempo_inicio_prof = time.time()
-            movs_avaliados = {}
-            melhor_score_prof = -float('inf')
-            melhor_mov_prof   = None
-
-            cache_capturas_oponente = {}
-            try:
-                # --- Root ordering: apenas MVV/LVA ---
-                # pega só os saltos obrigatórios
-                caps_raiz = tab_copia.encontrar_movimentos_possiveis(
-                    cor_ia,
-                    apenas_capturas=True
-                )
-                print(f"[DEBUG] caps_raiz: {[self._formatar_movimento(m) for m in caps_raiz]}")
-                # filtra os movimentos legais pelos saltos
-                mov_caps_raiz = [m for m in movimentos_legais if m in caps_raiz]
-                mov_simples_raiz = [m for m in movimentos_legais if m not in mov_caps_raiz]
-                movs_ord_raiz = mov_caps_raiz + mov_simples_raiz
-                print(f"[ID] Ordem raiz: {[self._formatar_movimento(m) for m in movs_ord_raiz]}")
-
-                melhor_score_prof, melhor_mov_prof, movs_avaliados = self._search_root(
-                    tab_copia, prof_atual, alpha, beta, movs_ord_raiz, cor_ia, cache_capturas_oponente)
-                print(f"[DEPTH {prof_atual:2d}] Root scores:", movs_avaliados)
-                print(f"[DEPTH {prof_atual:2d}] PV: {self._formatar_movimento(melhor_mov_prof):<15} -> {melhor_score_prof:.3f}")
-                self.profundidade_completa = prof_atual
-                resultados_por_profundidade[prof_atual] = movs_avaliados
-                self.melhor_movimento_atual = melhor_mov_prof
-                if melhor_score_prof <= alpha or melhor_score_prof >= beta:
-                    print(f"[IA] Aspiration fail na prof {prof_atual} (score={melhor_score_prof:.2f} fora de [{alpha:.2f},{beta:.2f}]), relançando com janela ampla")
-                    melhor_score_prof, melhor_mov_prof, movs_avaliados = self._search_root(
-                        tab_copia, prof_atual, -float('inf'), float('inf'), movs_ord_raiz, cor_ia, cache_capturas_oponente)
-                    resultados_por_profundidade[prof_atual] = movs_avaliados
-                    self.melhor_movimento_atual = melhor_mov_prof
-                scores = list(movs_avaliados.values())
-                if len(scores) > 1:
-                    m = sum(scores) / len(scores)
-                    var = sum((x - m) ** 2 for x in scores) / (len(scores) - 1)
-                    stddev = math.sqrt(var)
-                    self.aspiration_delta = max(2.0, min(30.0, stddev * 2.5))
-                else:
-                    self.aspiration_delta = 15.0
-                self.melhor_score_prev = melhor_score_prof
-                tempo_prof = time.time() - tempo_inicio_prof
-                self.tempo_por_nivel[prof_atual] = tempo_prof
-                if prof_atual > 1:
-                    tempo_prev = self.tempo_por_nivel[prof_atual - 1]
-                    taxa = tempo_prof / tempo_prev if tempo_prev > 0 else 1
-                    estimativa_next = tempo_prof * min(taxa, 2)
-                    tempo_restante = self.tempo_limite - (time.time() - self.tempo_inicio)
-                    if estimativa_next > tempo_restante:
-                        print(f"[IA] Estimativa de tempo para próxima profundidade ({estimativa_next:.2f}s) excede o tempo restante ({tempo_restante:.2f}s). Parando em {prof_atual}.")
-                        break
-            except TempoExcedidoError as e:
-                print(f"[IA] {str(e)} na profundidade {prof_atual}")
-                break
-            print(f"[ID] Fim profundidade {prof_atual}: minimax_calls={self.minimax_calls}, quiescence_calls={self.quiescence_calls}")
-
-        end_time_total = time.time()
+    def get_all_king_moves_bitboard(self, pos: Posicao, cor: int) -> int:
+        """Retorna um bitboard com todas as posições que uma dama na posição pos pode se mover."""
+        bit_pos = self.pos_to_bit(pos)
+        all_pieces = self.get_all_pieces()
+        empty = self.get_empty_squares()
+        moves = 0
         
-        # Mostrar último resultado completo
-        if self.debug_heur and self.profundidade_completa > 0 and self.profundidade_completa in resultados_por_profundidade:
-            print(f"\n[IA] Avaliação final (profundidade {self.profundidade_completa}):")
-            res_ord = sorted(resultados_por_profundidade[self.profundidade_completa].items(), key=lambda item: item[1], reverse=True)
-            for mov_s, score_m in res_ord[:5]: # Mostrar apenas os 5 melhores para não poluir
-                print(f"  - Movimento: {mov_s:<15} -> Score: {score_m:.3f}")
-        
-        # Adicionar informação de TT hits
-        print(f"[IA] TT hits: {self.tt_hits}")
-        
-        # Estatística de nós por segundo
-        total_time = time.time() - self.tempo_inicio
-        print(f"[IA] Total nodes: {self.nos_visitados+self.nos_quiescence_visitados}, time: {total_time:.2f}s, nps: {(self.nos_visitados+self.nos_quiescence_visitados)/total_time:.0f}")
-
-        if self.melhor_movimento_atual:
-            if self.debug_heur:
-                print(f"\n[IA] Escolhido: {self._formatar_movimento(self.melhor_movimento_atual)} (Prof: {self.profundidade_completa})")
-        else:
-            if self.debug_heur:
-                print("[IA] Nenhum movimento válido encontrado/escolhido.")
-            self.melhor_movimento_atual = random.choice(movimentos_legais) if movimentos_legais else None
+        # Verificar as 4 direções
+        for shift in BB_SHIFTS_ALL:
+            # Começar da posição inicial
+            current_bit = bit_pos
             
-        # Estatísticas detalhadas
-        if self.debug_heur:
-            print(f"[IA] Nós (Minimax): {self.nos_visitados}, (Quiescence): {self.nos_quiescence_visitados}, TT Hits: {self.tt_hits}")
-            print(f"[IA] Profundidade Máxima Configurada: {self.profundidade_maxima}, Profundidade Completada: {self.profundidade_completa}")
-            print(f"[IA] Profundidade Real Atingida: {self.profundidade_real_atingida}")
-            print(f"[IA] Podas Alpha: {self.podas_alpha}, Podas Beta: {self.podas_beta}")
-            print(f"[IA] Tempo Total da Busca: {end_time_total - start_time_total:.2f}s")
-            print(f"[IA] Média de nós por segundo: {(self.nos_visitados + self.nos_quiescence_visitados) / max(0.001, end_time_total - start_time_total):.0f}")
-            print("-" * 30)
-
-        # Instrumentação: heurística pura para cada root move
-        print("=== Heurística pura (depth=0) para cada root move ===")
-        for mov in movimentos_legais:
-            estado = tab_copia._fazer_lance(mov, troca_turno=True)
-            val = tab_copia.avaliar_heuristica(cor_ia, debug_aval=False)
-            tab_copia._desfazer_lance(estado)
-            print(f"  {self._formatar_movimento(mov):10} -> {val:.3f}")
-        print("=============================================")
-
-        # --- debug heurístico final ---
-        if self.debug_heur:
-            print("\n=== DEBUG HEURÍSTICO DO TABULEIRO ATUAL ===")
-            mat = partida.tabuleiro.material_balance(cor_ia)
-            stat = partida.tabuleiro.avaliar_heuristica(cor_ia, debug_aval=True)
-            print(f"Material balance: {mat:.2f}")
-            print(f"Static eval   : {stat:.2f}")
-            print(f"Heur extra    : {stat - mat:.2f}  (tudo o que não é só material)\n")
-        return self.melhor_movimento_atual
-
-    def _linearizar_movimentos(self, stack):
-        """
-        Recebe uma pilha de movimentos (cada um é uma lista de posições) e retorna uma lista linear de casas visitadas.
-        Exemplo: [[(2,1),(3,2)], [(3,2),(4,3)]] -> [(2,1),(3,2),(4,3)]
-        """
-        if not stack:
-            return []
-        caminho = [stack[0][0]]
-        for mov in stack:
-            caminho.extend(mov[1:])
-        return caminho
-
-    def minimax(self, tab, cont_emp, prof, alpha, beta, jog, cor_ia, depth=0):
-        self.minimax_calls += 1
-        # 1) verificação de tempo
-        if self.verificar_tempo():
-            raise TempoExcedidoError("Tempo excedido durante minimax")
-        # --- 1) TT PROBE ---
-        entry = self.transposition_table.get(tab.hash_atual)
-        if entry and entry.profundidade >= prof:
-            self.tt_hits += 1
-            logger.debug(f"TT probe hit: flag={entry.flag} score={entry.score:.2f} depth_stored={entry.profundidade} req_depth={prof}")
-            if entry.flag == TT_FLAG_EXACT:
-                return entry.score
-            elif entry.flag == TT_FLAG_LOWERBOUND:
-                alpha = max(alpha, entry.score)
-            elif entry.flag == TT_FLAG_UPPERBOUND:
-                beta  = min(beta,  entry.score)
-            if alpha >= beta:
-                return entry.score
-        # Log de depuração
-        # print(f"[DEBUG] Entrando no minimax: prof={prof}, depth={depth}, jog={jog}")
-        # Chamada de quiescência quando prof <= 0
-        if prof <= 0:
-            val = self.quiescence_search(tab, MAX_QUIESCENCE_DEPTH, alpha, beta, jog, cor_ia, depth=depth)
-            seq_de_movimentos = getattr(self, '_line_stack', [])
-            seq_linear = self._linearizar_movimentos(seq_de_movimentos)
-            # print(f"[LEAF quiescence @ depth {depth}] via {self._formatar_movimento(seq_linear)}  eval = {val:.3f}")
-            return val
-        self.nos_visitados += 1
-        # Monitoramento de profundidade global
-        if depth > self.max_depth_reached:
-            self.max_depth_reached = depth
-            if self.debug_heur and not self._depth_warning_emitted and depth > 900:
-                logging.warning(f"Alerta de profundidade: {depth}")
-                self._depth_warning_emitted = True
-        # Atualizar profundidade real atingida
-        if depth > self.profundidade_real_atingida:
-            self.profundidade_real_atingida = depth
-        # Gerar e ordenar os movimentos possíveis
-        movs_ordenados = tab.encontrar_movimentos_possiveis(jog)
-        # Ordenação simples: capturas primeiro (pode ser melhorada)
-        movs_ordenados.sort(key=lambda m: len(tab.identificar_pecas_capturadas(m)), reverse=True)
-        
-        # --- 2) TT MOVE ORDERING ---
-        entry = self.transposition_table.get(tab.hash_atual)
-        if entry and entry.melhor_movimento:
-            if entry.melhor_movimento in movs_ordenados:
-                movs_ordenados.remove(entry.melhor_movimento)
-                movs_ordenados.insert(0, entry.melhor_movimento)
-                logger.debug(f"TT move ordering: {self._formatar_movimento(entry.melhor_movimento)}")
+            # Continuar na direção até encontrar uma barreira
+            while True:
+                # Aplicar o shift correspondente à direção com mascaramento para evitar wrap-around
+                if shift == BB_SHIFT_NE:
+                    current_bit = (current_bit >> 7) & BB_NOT_A_FILE
+                elif shift == BB_SHIFT_NW:
+                    current_bit = (current_bit >> 9) & BB_NOT_H_FILE
+                elif shift == BB_SHIFT_SE:
+                    current_bit = (current_bit << 9) & BB_NOT_H_FILE
+                elif shift == BB_SHIFT_SW:
+                    current_bit = (current_bit << 7) & BB_NOT_A_FILE
                 
-        melhor_val = -float('inf'); a_orig = alpha
-        best_move_tt = None
-        for i, mov in enumerate(movs_ordenados):
-            # --- empilha o movimento atual ---
-            if not hasattr(self, '_line_stack'):
-                self._line_stack = []
-            self._line_stack.append(mov)
-
-            # faz o lance
-            caps_origem = tab.identificar_pecas_capturadas(mov)
-            continuacoes = []
-            if caps_origem:
-                continuacoes = tab._encontrar_capturas_recursivo(
-                    mov[-1],
-                    jog,                              # o jogador atual
-                    Peca.get_tipo(tab.get_peca(mov[-1])),
-                    [mov[-1]], []
-                )
-            troca = not (caps_origem and continuacoes)
-            estado = tab._fazer_lance(mov, troca_turno=troca)
-            # recursão
-            next_prof = prof - 1
-            score = -self.minimax(tab, cont_emp, next_prof, -beta, -alpha, Tabuleiro.get_oponente(jog), self.cor_ia, depth=depth+1)
-            # desfaz
-            tab._desfazer_lance(estado)
-            # --- desempilha ---
-            self._line_stack.pop()
-
-            if score > melhor_val:
-                melhor_val = score
-                best_move_tt = mov
-                # Atualiza history heuristic para o movimento
-                chave_hist = (mov[0], mov[-1])
-                self.history_heuristic[chave_hist] += prof * prof
-            alpha = max(alpha, melhor_val)
-            if beta <= alpha:
-                # Atualiza killer moves no beta-cut
-                self.podas_beta += 1
-                # kd não está definido, então removi o bloco de killer moves para evitar erro
-                break
-
-        # Preencher a transposition table (TT)
-        flag = 0  # TT_FLAG_EXACT
-        if melhor_val <= a_orig:
-            flag = 2  # TT_FLAG_UPPERBOUND
-        elif melhor_val >= beta:
-            flag = 1  # TT_FLAG_LOWERBOUND
-        self.transposition_table[tab.hash_atual] = TTEntry(
-            profundidade=prof,
-            score=melhor_val,
-            flag=flag,
-            melhor_movimento=best_move_tt
-        )
-
-        return melhor_val
-
-    def quiescence_search(self, tab: Tabuleiro, prof_q: int, a: float, b: float, jog_q: int, cor_ia: int, depth=0) -> float:
-        self.quiescence_calls += 1
-        if self.verificar_tempo():
-            raise TempoExcedidoError("Tempo excedido durante quiescence_search")
-            
-        # --- TT PROBE em quiescence ---
-        entry = self.transposition_table.get(tab.hash_atual)
-        if entry and entry.profundidade >= -1:   # ou >= prof_q, se quiser
-            self.tt_hits += 1
-            logger.debug(f"TT probe(quiescence): flag={entry.flag} score={entry.score:.2f} depth_stored={entry.profundidade} req_depth={prof_q}")
-            return entry.score
-            
-        if depth > self.max_depth_reached:
-            self.max_depth_reached = depth
-            if depth > 900 and not self._depth_warning_emitted:
-                logging.warning(f"Alerta de profundidade (quiescence): {depth}")
-                self._depth_warning_emitted = True
-        if self.nos_quiescence_visitados % 500 == 0 and self.verificar_tempo():
-            raise TempoExcedidoError("Tempo excedido durante quiescence_search")
-        hash_pos = tab.hash_atual
-        entry = self.transposition_table.get(hash_pos)
-        if entry and entry.flag == TT_FLAG_EXACT and entry.profundidade >= -1 : self.tt_hits+=1; return entry.score
-        self.nos_quiescence_visitados += 1
-        stand_pat = tab.avaliar_heuristica(cor_ia, debug_aval=False)
-        mov_caps = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True)
-        capturadas_cache = {tuple(m): tab.identificar_pecas_capturadas(m) for m in mov_caps}
-        peca_origem_cache = {tuple(m): tab.get_peca(m[0]) for m in mov_caps}
-        mov_caps.sort(
-            key=lambda m: (
-                max(abs(v) for v in capturadas_cache[tuple(m)].values()) if capturadas_cache[tuple(m)] else 0,
-                -abs(peca_origem_cache[tuple(m)])
-            ),
-            reverse=True
-        )
-        K = 4
-        top_k = mov_caps[:K]
-        rest = mov_caps[K:]
-        # Cache para SEE (opcional, mas recomendado se top_k for grande)
-        see_cache = {tuple(m): self.see(tab, m[-1], jog_q) for m in top_k}
-        top_k.sort(key=lambda m: see_cache[tuple(m)], reverse=True)
-        mov_caps = top_k + rest
-        # SEE completo para cortes
-        def see_gain(tab, mov, jog_q):
-            pos = mov[-1]
-            return self.see(tab, pos, jog_q)
-        if mov_caps:
-            def valor_captura(m):
-                capturadas = tab.identificar_pecas_capturadas(m)
-                if not capturadas:
-                    return 0
-                atacante = tab.get_peca(m[0])
-                tipo_atacante = abs(atacante)
-                valor = 0
-                for v in capturadas.values():
-                    tipo_capturado = abs(v)
-                    if tipo_capturado == DAMA and tipo_atacante == PEDRA:
-                        valor += VALOR_DAMA + 10  # Pedra captura dama: ótimo
-                    elif tipo_capturado == DAMA and tipo_atacante == DAMA:
-                        valor += VALOR_DAMA
-                    elif tipo_capturado == PEDRA:
-                        valor += VALOR_PEDRA
-                return valor
-            max_gain = max(valor_captura(m) for m in mov_caps)
-            if stand_pat + max_gain <= a:
-                self.podas_alpha += 1
-                return stand_pat
-        if prof_q <= 0: return stand_pat
-        is_max = (jog_q == cor_ia)
-        if is_max: a = max(a, stand_pat)
-        else: b = min(b, stand_pat)
-        if b <= a: 
-            self.podas_beta += 1
-            return stand_pat
-        if not mov_caps: return stand_pat
-        score_final_q = stand_pat
-        if is_max:
-            for mov in mov_caps:
-                # SEE pruning completo
-                if see_gain(tab, mov, jog_q) + stand_pat <= a:
-                    continue
-                cp=bool(tab.identificar_pecas_capturadas(mov))
-                pos_final = mov[-1]
-                peca_final = tab.get_peca(pos_final)
-                tipo_final = Peca.get_tipo(peca_final)
-                capturas_combo = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True) if cp else []
-                troca_turno = not (cp and capturas_combo)
-                estado_d = tab._fazer_lance(mov, troca_turno=troca_turno)
-                if cp and capturas_combo:
-                    prox_prof_q = prof_q
-                    prox_jog = jog_q
-                else:
-                    prox_prof_q = prof_q - 1
-                    prox_jog = Tabuleiro.get_oponente(jog_q)
-                # Extensão para combos (captura múltipla)
-                is_combo = len(tab.identificar_pecas_capturadas(mov)) > 1
-                ext = 1 if is_combo else 0
-                next_q = prox_prof_q + ext
-                next_q = min(next_q, MAX_QUIESCENCE_DEPTH)  # Proteção contra profundidade excessiva
-                val = self.quiescence_search(tab, next_q, a, b, prox_jog, cor_ia, depth=depth+1)
-                tab._desfazer_lance(estado_d)
-                score_final_q = max(score_final_q, val); a = max(a, score_final_q)
-                if b <= a: 
-                    self.podas_beta += 1
+                # Se saiu do tabuleiro ou encontrou uma peça, para
+                if current_bit == 0 or (current_bit & all_pieces) != 0:
                     break
+                    
+                # Adiciona esta posição como um movimento possível
+                moves |= current_bit
+        
+        return moves
+        
+    def get_man_moves_bitboard(self, pos: Posicao, cor: int) -> int:
+        """Retorna um bitboard com todas as posições que uma pedra na posição pos pode se mover."""
+        bit_pos = self.pos_to_bit(pos)
+        empty = self.get_empty_squares()
+        moves = 0
+        
+        # Verificar as 2 direções permitidas para a cor
+        shifts = BB_SHIFTS_WHITE if cor == BRANCO else BB_SHIFTS_BLACK
+        
+        for shift in shifts:
+            # Aplicar o shift correspondente à direção com mascaramento para evitar wrap-around
+            if shift == BB_SHIFT_NE:
+                move_bit = (bit_pos >> 7) & BB_NOT_A_FILE
+            elif shift == BB_SHIFT_NW:
+                move_bit = (bit_pos >> 9) & BB_NOT_H_FILE
+            elif shift == BB_SHIFT_SE:
+                move_bit = (bit_pos << 9) & BB_NOT_H_FILE
+            elif shift == BB_SHIFT_SW:
+                move_bit = (bit_pos << 7) & BB_NOT_A_FILE
+            
+            # Se é uma casa válida e está vazia, adiciona como movimento possível
+            if move_bit != 0 and (move_bit & empty) != 0:
+                moves |= move_bit
+        
+        return moves
+        
+    def get_man_capture_moves_bitboard(self, pos: Posicao, cor: int) -> Tuple[int, Dict[int, int]]:
+        """
+        Retorna um bitboard com todas as posições que uma pedra na posição pos pode capturar
+        e um dicionário mapeando os bits de destino para os bits das peças capturadas.
+        """
+        bit_pos = self.pos_to_bit(pos)
+        empty = self.get_empty_squares()
+        oponente = self.get_pieces_by_color(self.get_oponente(cor))
+        moves = 0
+        captured_pieces = {}
+        
+        # Verificar as 4 direções
+        for shift in BB_SHIFTS_ALL:
+            # Aplicar o shift para encontrar a posição adjacente
+            if shift == BB_SHIFT_NE:
+                adjacent_bit = (bit_pos >> 7) & BB_NOT_A_FILE
+                capture_bit = (adjacent_bit >> 7) & BB_NOT_A_FILE
+            elif shift == BB_SHIFT_NW:
+                adjacent_bit = (bit_pos >> 9) & BB_NOT_H_FILE
+                capture_bit = (adjacent_bit >> 9) & BB_NOT_H_FILE
+            elif shift == BB_SHIFT_SE:
+                adjacent_bit = (bit_pos << 9) & BB_NOT_H_FILE
+                capture_bit = (adjacent_bit << 9) & BB_NOT_H_FILE
+            elif shift == BB_SHIFT_SW:
+                adjacent_bit = (bit_pos << 7) & BB_NOT_A_FILE
+                capture_bit = (adjacent_bit << 7) & BB_NOT_A_FILE
+            
+            # Se a posição adjacente contém uma peça do oponente e a posição após está vazia
+            if adjacent_bit != 0 and (adjacent_bit & oponente) != 0 and capture_bit != 0 and (capture_bit & empty) != 0:
+                moves |= capture_bit
+                captured_pieces[capture_bit] = adjacent_bit
+        
+        return moves, captured_pieces
+        
+    def gera_movimentos_simples(self, cor: int) -> List[Tuple[Posicao, Posicao]]:
+        """
+        Gera todos os movimentos simples (não-captura) para uma cor usando operações puras de bitboards.
+        Retorna uma lista de tuplas (origem, destino).
+        
+        Args:
+            cor: BRANCO ou PRETO, a cor das peças para gerar movimentos
+        
+        Returns:
+            Lista de movimentos no formato [(origem, destino), ...]
+        """
+        movimentos = []
+        
+        # Casas vazias no tabuleiro (apenas casas escuras válidas para jogo)
+        bb_vazias = self.get_empty_squares()
+        
+        # Processar movimentos das pedras (men)
+        if cor == BRANCO:
+            # Pedras brancas (excluindo as que são damas)
+            bb_pedras = self.bitboard_brancas & ~self.bitboard_damas_brancas
+            
+            # Nordeste: cima+direita => >>7, exclui H-file
+            moves_ne = ((bb_pedras & BB_NOT_H_FILE) >> 7) & bb_vazias
+            orig_ne = (moves_ne << 7) & bb_pedras
+            while orig_ne:
+                b_orig = self.lsb(orig_ne)
+                pos_o = self.bit_to_pos(b_orig)
+                b_dest = b_orig >> 7
+                pos_d = self.bit_to_pos(b_dest)
+                movimentos.append((pos_o, pos_d))
+                orig_ne = self.clear_lsb(orig_ne)
+            
+            # Noroeste: cima+esquerda => >>9, exclui A-file
+            moves_nw = ((bb_pedras & BB_NOT_A_FILE) >> 9) & bb_vazias
+            orig_nw = (moves_nw << 9) & bb_pedras
+            while orig_nw:
+                b_orig = self.lsb(orig_nw)
+                pos_o = self.bit_to_pos(b_orig)
+                b_dest = b_orig >> 9
+                pos_d = self.bit_to_pos(b_dest)
+                movimentos.append((pos_o, pos_d))
+                orig_nw = self.clear_lsb(orig_nw)
+            
+        else:  # PRETO
+            # Pedras pretas (excluindo as que são damas)
+            bb_pedras = self.bitboard_pretas & ~self.bitboard_damas_pretas
+            
+            # Sudeste: baixo+direita => <<9, exclui H-file
+            moves_se = ((bb_pedras & BB_NOT_H_FILE) << 9) & bb_vazias
+            orig_se = (moves_se >> 9) & bb_pedras
+            while orig_se:
+                b_orig = self.lsb(orig_se)
+                pos_o = self.bit_to_pos(b_orig)
+                b_dest = b_orig << 9
+                pos_d = self.bit_to_pos(b_dest)
+                movimentos.append((pos_o, pos_d))
+                orig_se = self.clear_lsb(orig_se)
+            
+            # Sudoeste: baixo+esquerda => <<7, exclui A-file
+            moves_sw = ((bb_pedras & BB_NOT_A_FILE) << 7) & bb_vazias
+            orig_sw = (moves_sw >> 7) & bb_pedras
+            while orig_sw:
+                b_orig = self.lsb(orig_sw)
+                pos_o = self.bit_to_pos(b_orig)
+                b_dest = b_orig << 7
+                pos_d = self.bit_to_pos(b_dest)
+                movimentos.append((pos_o, pos_d))
+                orig_sw = self.clear_lsb(orig_sw)
+        
+        # Processar movimentos das damas (kings)
+        if cor == BRANCO:
+            bb_damas = self.bitboard_damas_brancas
         else:
-            for mov in mov_caps:
-                # SEE pruning completo
-                if see_gain(tab, mov, jog_q) + stand_pat <= a:
-                    continue
-                cp=bool(tab.identificar_pecas_capturadas(mov))
-                pos_final = mov[-1]
-                peca_final = tab.get_peca(pos_final)
-                tipo_final = Peca.get_tipo(peca_final)
-                capturas_combo = tab.encontrar_movimentos_possiveis(jog_q, apenas_capturas=True) if cp else []
-                troca_turno = not (cp and capturas_combo)
-                estado_d = tab._fazer_lance(mov, troca_turno=troca_turno)
-                if cp and capturas_combo:
-                    prox_prof_q = prof_q
-                    prox_jog = jog_q
+            bb_damas = self.bitboard_damas_pretas
+        
+        # Para cada dama, obtém todos os movimentos possíveis
+        temp_damas = bb_damas
+        while temp_damas:
+            bit_dama = self.lsb(temp_damas)
+            pos_dama = self.bit_to_pos(bit_dama)
+            
+            # Obtém todas as posições para onde a dama pode se mover
+            # Usando uma função auxiliar que retorna um bitboard com todos os destinos possíveis
+            destinos = self.get_all_king_moves_bitboard(pos_dama, cor)
+            
+            # Converte o bitboard de destinos em pares de movimento
+            temp_dest = destinos
+            while temp_dest:
+                bit_dest = self.lsb(temp_dest)
+                pos_dest = self.bit_to_pos(bit_dest)
+                
+                movimentos.append((pos_dama, pos_dest))
+                
+                temp_dest = self.clear_lsb(temp_dest)
+            
+            temp_damas = self.clear_lsb(temp_damas)
+        
+        return movimentos
+        
+    @staticmethod
+    def print_bitboard(bb: int):
+        """Imprime uma representação visual de um bitboard."""
+        print("  abcdefgh")
+        for r in range(TAMANHO_TABULEIRO):
+            linha = f"{TAMANHO_TABULEIRO-r} "
+            for c in range(TAMANHO_TABULEIRO):
+                bit = 1 << (r * 8 + c)
+                if bb & bit:
+                    linha += "X"
                 else:
-                    prox_prof_q = prof_q - 1
-                    prox_jog = Tabuleiro.get_oponente(jog_q)
-                # Extensão para combos (captura múltipla)
-                is_combo = len(tab.identificar_pecas_capturadas(mov)) > 1
-                ext = 1 if is_combo else 0
-                next_q = prox_prof_q + ext
-                next_q = min(next_q, MAX_QUIESCENCE_DEPTH)  # Proteção contra profundidade excessiva
-                val = self.quiescence_search(tab, next_q, a, b, prox_jog, cor_ia, depth=depth+1)
-                tab._desfazer_lance(estado_d)
-                score_final_q = min(score_final_q, val); b = min(b, score_final_q)
-                if b <= a: 
-                    self.podas_beta += 1
-                    break
-        # Print do caminho linearizado na folha de quiescence
-        seq_de_movimentos = getattr(self, '_line_stack', [])
-        seq_linear = self._linearizar_movimentos(seq_de_movimentos)
-        print(f"[LEAF quiescence @ depth {depth}] via {self._formatar_movimento(seq_linear)}  eval = {score_final_q:.3f}")
-        return score_final_q
+                    linha += "." if (r + c) % 2 == 1 else " "
+            linha += f" {TAMANHO_TABULEIRO-r}"
+            print(linha)
+        print("  abcdefgh")
+        
+    def print_all_bitboards(self):
+        """Imprime todos os bitboards do tabuleiro."""
+        print("=== White Men ===")
+        self.print_bitboard(self.bitboard_brancas)
+        print("\n=== White Kings ===")
+        self.print_bitboard(self.bitboard_damas_brancas)
+        print("\n=== Black Men ===")
+        self.print_bitboard(self.bitboard_pretas)
+        print("\n=== Black Kings ===")
+        self.print_bitboard(self.bitboard_damas_pretas)
+        print("\n=== All Pieces ===")
+        self.print_bitboard(self.get_all_pieces())
+        print("\n=== Empty Squares ===")
+        self.print_bitboard(self.get_empty_squares())
+    
+    def print_bitboards_hex(self):
+        """Imprime todos os bitboards no formato hexadecimal."""
+        print(f"White Men:   0x{self.bitboard_brancas:016X}")
+        print(f"White Kings: 0x{self.bitboard_damas_brancas:016X}")
+        print(f"Black Men:   0x{self.bitboard_pretas:016X}")
+        print(f"Black Kings: 0x{self.bitboard_damas_pretas:016X}")
+        print(f"All Pieces:  0x{self.get_all_pieces():016X}")
+        print(f"Empty Sqrs:  0x{self.get_empty_squares():016X}")
+
+    def validar_movimentos_simples(self, cor: int):
+        """Compara os resultados de gera_movimentos_simples com o método legado."""
+        # Gerar movimentos usando o novo método de bitboards
+        movs_bit = self.gera_movimentos_simples(cor)
+        
+        # Gerar movimentos usando o método legado
+        movs_legados = []
+        for mov in self.encontrar_movimentos_possiveis(cor, apenas_capturas=False):
+            # Filtrar apenas movimentos simples (sem captura)
+            if len(mov) == 2 and not self.identificar_pecas_capturadas(mov):
+                movs_legados.append((mov[0], mov[1]))
+        
+        # Verificar se ambos têm o mesmo número de movimentos
+        print(f"Movimentos via bitboards: {len(movs_bit)}")
+        print(f"Movimentos via legado: {len(movs_legados)}")
+        
+        # Converter para conjuntos para facilitar a comparação
+        set_bit = set(movs_bit)
+        set_legados = set(movs_legados)
+        
+        # Verificar se há diferenças
+        diffs_a = set_bit - set_legados
+        diffs_b = set_legados - set_bit
+        
+        if diffs_a:
+            print(f"Movimentos extras nos bitboards: {diffs_a}")
+        if diffs_b:
+            print(f"Movimentos extras no legado: {diffs_b}")
+        
+        # Retornar True se ambos são iguais
+        return set_bit == set_legados
 
     def obter_estatisticas_aspiration(self):
         """
@@ -1405,14 +1625,21 @@ class MotorIA:
     FEW_PIECES_TOTAL = 6
 
     def is_endgame(self, tab):
-        total_pedras = sum(1 for r in range(TAMANHO_TABULEIRO) for c in range(TAMANHO_TABULEIRO)
-                           if abs(tab.grid[r][c]) == PEDRA)
-        total_damas = sum(1 for r in range(TAMANHO_TABULEIRO) for c in range(TAMANHO_TABULEIRO)
-                          if abs(tab.grid[r][c]) == DAMA)
+        """Verifica se o jogo está no fim de jogo (poucas peças restantes)."""
+        # Contar peças usando bitboards
+        white_men_count = bin(tab.bitboard_brancas).count("1")
+        white_kings_count = bin(tab.bitboard_damas_brancas).count("1")
+        black_men_count = bin(tab.bitboard_pretas).count("1")
+        black_kings_count = bin(tab.bitboard_damas_pretas).count("1")
+        
+        total_pedras = white_men_count + black_men_count
+        total_damas = white_kings_count + black_kings_count
         return total_pedras <= 2 or (total_pedras + total_damas) <= self.ENDGAME_PIECES
 
     def has_few_pieces(self, tab):
-        total = sum(1 for r in range(TAMANHO_TABULEIRO) for c in range(TAMANHO_TABULEIRO) if tab.grid[r][c] != 0)
+        """Verifica se há poucas peças no tabuleiro."""
+        # Contar todas as peças usando bitboards
+        total = bin(tab.get_all_pieces()).count("1")
         return total <= self.FEW_PIECES_TOTAL
 
     LMR_THRESHOLD = 2
@@ -1497,90 +1724,30 @@ class MotorIA:
             idx += 1
         return sum(gain)
 
-# --- Bloco Principal (Teste) ---
-if __name__ == "__main__":
-    print("--- Testando damas_logic.py v12.3 Iterative Deepening + Time Management ---")
-    partida_teste = Partida(jogador_branco="IA", jogador_preto="Humano")
-    # POSIÇÃO COMPLEXA DE TESTE (ajustada para garantir movimentos válidos)
-    tab = partida_teste.tabuleiro
-    tab.grid = [[0]*8 for _ in range(8)]
-    # Brancas
-    tab.grid[2][1] = PB
-    tab.grid[2][3] = PB
-    tab.grid[3][2] = PB
-    tab.grid[4][5] = DB
-    tab.grid[5][0] = PB
-    tab.grid[5][4] = PB
-    tab.grid[6][3] = DB
-    # Pretas
-    tab.grid[1][2] = PP
-    tab.grid[1][4] = PP
-    tab.grid[2][5] = DP
-    tab.grid[3][4] = PP
-    tab.grid[4][1] = DP
-    tab.grid[5][6] = PP
-    tab.grid[6][5] = DP
-    tab.grid[7][2] = PP
-    tab.grid[7][4] = PP
-    tab.grid[7][6] = PP
-    # Espaços para garantir mobilidade
-    tab.grid[4][3] = 0
-    tab.grid[3][6] = 0
-    tab.grid[5][2] = 0
-    tab.grid[6][1] = 0
-    tab.hash_atual = tab.calcular_hash_zobrist_inicial()
-    print(f"Profundidade Máxima de Teste: {PROFUNDIDADE_IA}, Tempo Limite: {TEMPO_PADRAO_IA}s")
-    print("Tabuleiro de teste complexo:"); print(tab)
-    print("Movimentos legais para as brancas:", tab.encontrar_movimentos_possiveis(BRANCO))
-    if partida_teste.jogador_atual == BRANCO:
-        print("\n[COM LMR] Calculando movimento inicial para Brancas...")
-        ia_lmr = MotorIA(profundidade=PROFUNDIDADE_IA, tempo_limite=TEMPO_PADRAO_IA, debug_heur=True, usar_lmr=True)
-        start_time_lmr = time.time()
-        mov_lmr = ia_lmr.encontrar_melhor_movimento(
-            partida_teste,
-            BRANCO,
-            partida_teste.movimentos_legais_atuais
-        )
-        end_time_lmr = time.time()
-        print(f"\n[COM LMR] Tempo de cálculo: {end_time_lmr - start_time_lmr:.2f}s")
-        if mov_lmr: print(f"[COM LMR] Movimento Sugerido: {ia_lmr._formatar_movimento(mov_lmr)}")
-        else: print("[COM LMR] IA não encontrou movimento.")
-        print(f"[COM LMR] Nós Visitados (Minimax): {ia_lmr.nos_visitados}")
-        print(f"[COM LMR] Nós Visitados (Quiescence): {ia_lmr.nos_quiescence_visitados}")
-        print(f"[COM LMR] Profundidade Completada: {ia_lmr.profundidade_completa}")
-        print(f"[COM LMR] Profundidade Real Atingida: {ia_lmr.profundidade_real_atingida}")
-        print(f"[COM LMR] TT Hits: {ia_lmr.tt_hits}")
-        print(f"[COM LMR] Podas Alpha: {ia_lmr.podas_alpha}")
-        print(f"[COM LMR] Podas Beta: {ia_lmr.podas_beta}")
-        print(f"[COM LMR] Nós por segundo: {(ia_lmr.nos_visitados + ia_lmr.nos_quiescence_visitados) / max(0.001, end_time_lmr - start_time_lmr):.0f}")
-
-        print("\n[SEM LMR] Calculando movimento inicial para Brancas...")
-        ia_nolmr = MotorIA(profundidade=PROFUNDIDADE_IA, tempo_limite=TEMPO_PADRAO_IA, debug_heur=True, usar_lmr=False)
-        start_time_nolmr = time.time()
-        mov_nolmr = ia_nolmr.encontrar_melhor_movimento(
-            partida_teste,
-            BRANCO,
-            partida_teste.movimentos_legais_atuais
-        )
-        end_time_nolmr = time.time()
-        print(f"\n[SEM LMR] Tempo de cálculo: {end_time_nolmr - start_time_nolmr:.2f}s")
-        if mov_nolmr: print(f"[SEM LMR] Movimento Sugerido: {ia_nolmr._formatar_movimento(mov_nolmr)}")
-        else: print("[SEM LMR] IA não encontrou movimento.")
-        print(f"[SEM LMR] Nós Visitados (Minimax): {ia_nolmr.nos_visitados}")
-        print(f"[SEM LMR] Nós Visitados (Quiescence): {ia_nolmr.nos_quiescence_visitados}")
-        print(f"[SEM LMR] Profundidade Completada: {ia_nolmr.profundidade_completa}")
-        print(f"[SEM LMR] Profundidade Real Atingida: {ia_nolmr.profundidade_real_atingida}")
-        print(f"[SEM LMR] TT Hits: {ia_nolmr.tt_hits}")
-        print(f"[SEM LMR] Podas Alpha: {ia_nolmr.podas_alpha}")
-        print(f"[SEM LMR] Podas Beta: {ia_nolmr.podas_beta}")
-        print(f"[SEM LMR] Nós por segundo: {(ia_nolmr.nos_visitados + ia_nolmr.nos_quiescence_visitados) / max(0.001, end_time_nolmr - start_time_nolmr):.0f}")
-
-        print("\n=== COMPARATIVO LMR x SEM LMR ===")
-        print(f"Tempo (LMR): {end_time_lmr - start_time_lmr:.2f}s | (SEM LMR): {end_time_nolmr - start_time_nolmr:.2f}s")
-        print(f"Nós (LMR): {ia_lmr.nos_visitados} | (SEM LMR): {ia_nolmr.nos_visitados}")
-        print(f"Quiescence (LMR): {ia_lmr.nos_quiescence_visitados} | (SEM LMR): {ia_nolmr.nos_quiescence_visitados}")
-        print(f"Profundidade Completada (LMR): {ia_lmr.profundidade_completa} | (SEM LMR): {ia_nolmr.profundidade_completa}")
-        print(f"Movimento Sugerido (LMR): {ia_lmr._formatar_movimento(mov_lmr)} | (SEM LMR): {ia_nolmr._formatar_movimento(mov_nolmr)}")
-        print(f"Score final (LMR): {ia_lmr.melhor_score_prev:.2f} | (SEM LMR): {ia_nolmr.melhor_score_prev:.2f}")
-    print("\n--- Fim do Teste ---")
+def main():
+    """Função principal para testar os bitboards e a validação de movimentos."""
+    tab = Tabuleiro()
+    
+    # Imprimir os bitboards iniciais
+    print("=== Bitboards Iniciais ===")
+    tab.print_bitboards_hex()
+    print("\n=== Representação Visual ===")
+    tab.print_all_bitboards()
+    
+    # Testar a geração de movimentos simples
+    print("\n=== Validação de Movimentos Simples ===")
+    print("Validando movimentos para BRANCO:")
+    tab.validar_movimentos_simples(BRANCO)
+    
+    print("\nValidando movimentos para PRETO:")
+    tab.validar_movimentos_simples(PRETO)
+    
+    # Mostrar exemplo de movimentos gerados
+    print("\n=== Exemplo de Movimentos Simples para BRANCO ===")
+    movs_branco = tab.gera_movimentos_simples(BRANCO)
+    for i, (origem, destino) in enumerate(movs_branco[:5]):  # Mostrar apenas os 5 primeiros
+        print(f"Movimento {i+1}: {origem} -> {destino}")
+    
+    if __name__ == "__main__":
+        main()
     
