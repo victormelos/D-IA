@@ -10,6 +10,7 @@ import statistics
 import math
 import logging
 import cProfile, pstats
+from functools import lru_cache
 
 logging.basicConfig(
     format='%(asctime)s %(levelname)s: %(message)s',
@@ -158,7 +159,7 @@ class Peca:
 
 # --- Classe Tabuleiro ---
 class Tabuleiro:
-    def __init__(self, estado_inicial=True):
+    def __init__(self, estado_inicial: bool = True) -> None:
         # Inicializa os bitboards (representações de 64 bits do tabuleiro)
         self.bitboard_brancas = 0
         self.bitboard_pretas = 0
@@ -200,19 +201,19 @@ class Tabuleiro:
         self.movimentos_cache = {}
         self.capturas_cache = {}
         
-    def print_bitboards_hex(self):
+    def print_bitboards_hex(self) -> None:
         """Imprime todos os bitboards no formato hexadecimal."""
-        print(f"White Men:   0x{self.bitboard_brancas:016X}")
-        print(f"White Kings: 0x{self.bitboard_damas_brancas:016X}")
-        print(f"Black Men:   0x{self.bitboard_pretas:016X}")
-        print(f"Black Kings: 0x{self.bitboard_damas_pretas:016X}")
-        print(f"All Pieces:  0x{self.get_all_pieces():016X}")
-        print(f"Empty Sqrs:  0x{self.get_empty_squares():016X}")
+        logger.info(f"White Men:   0x{self.bitboard_brancas:016X}")
+        logger.info(f"White Kings: 0x{self.bitboard_damas_brancas:016X}")
+        logger.info(f"Black Men:   0x{self.bitboard_pretas:016X}")
+        logger.info(f"Black Kings: 0x{self.bitboard_damas_pretas:016X}")
+        logger.info(f"All Pieces:  0x{self.get_all_pieces():016X}")
+        logger.info(f"Empty Sqrs:  0x{self.get_empty_squares():016X}")
 
-    def print_all_bitboards(self):
+    def print_all_bitboards(self) -> None:
         """Imprime todos os bitboards em formato visual de tabuleiro."""
         def print_bitboard(bb, nome):
-            print(f"\n{nome}:")
+            logger.info(f"\n{nome}:")
             for linha in range(8):
                 linha_str = ""
                 for coluna in range(8):
@@ -221,22 +222,20 @@ class Tabuleiro:
                         linha_str += "X "
                     else:
                         linha_str += ". "
-                print(f"{7-linha} {linha_str}")
-            print("  0 1 2 3 4 5 6 7")
-        
+                logger.info(f"{7-linha} {linha_str}")
+            logger.info("  0 1 2 3 4 5 6 7")
         print_bitboard(self.bitboard_brancas, "Peças Brancas")
         print_bitboard(self.bitboard_damas_brancas, "Damas Brancas")
         print_bitboard(self.bitboard_pretas, "Peças Pretas")
         print_bitboard(self.bitboard_damas_pretas, "Damas Pretas")
-        print_bitboard(self.bitboard_brancas | self.bitboard_damas_brancas | 
-                       self.bitboard_pretas | self.bitboard_damas_pretas, "Todas as Peças")
+        print_bitboard(self.bitboard_brancas | self.bitboard_damas_brancas | self.bitboard_pretas | self.bitboard_damas_pretas, "Todas as Peças")
     
-    def pos_to_bit(self, pos):
+    def pos_to_bit(self, pos: Posicao) -> int:
         """Converte uma posição (linha, coluna) para sua representação em bit."""
         linha, coluna = pos
         return 1 << (linha * 8 + coluna)
         
-    def bit_to_pos(self, bit):
+    def bit_to_pos(self, bit: int) -> Optional[Posicao]:
         """Converte um bit para sua posição (linha, coluna)."""
         if bit == 0:
             return None
@@ -247,7 +246,7 @@ class Tabuleiro:
             bit_pos += 1
         return (bit_pos // 8, bit_pos % 8)
     
-    def _bit_scan_forward(self, bb):
+    def _bit_scan_forward(self, bb: int) -> int:
         """
         Retorna o índice do bit menos significativo setado em 1.
         Esta é uma versão otimizada para ser usada em operações com bitboards.
@@ -267,81 +266,39 @@ class Tabuleiro:
             idx += 1
         return idx
     
-    def validar_movimentos_simples(self, cor):
-        """
-        Valida os movimentos simples gerados pelo método de bitboards comparando com o método tradicional.
-        
-        Args:
-            cor: COR_BRANCA ou COR_PRETA
-            
-        Returns:
-            bool: True se os resultados forem idênticos, False caso contrário.
-        """
-        # Obtém os movimentos usando o novo método de bitboards
-        movimentos_bb = self.gera_movimentos_simples(cor)
-        # Obtém os movimentos usando o método tradicional
-        movimentos_trad = self.encontrar_movimentos_possiveis(cor, apenas_capturas=False)
-        
-        # Filtra apenas os movimentos simples (não-capturas) do método tradicional
-        movimentos_trad_simples = [m for m in movimentos_trad if len(m) == 2]
-        
-        # Ordena os movimentos para facilitar a comparação
-        movimentos_bb.sort()
-        movimentos_trad_simples.sort()
-        
-        # Verifica se os conjuntos de movimentos são idênticos
-        if set(map(tuple, movimentos_bb)) == set(map(tuple, movimentos_trad_simples)):
-            print(f"Validação bem-sucedida para a cor {cor}. Ambos os métodos geraram os mesmos {len(movimentos_bb)} movimentos.")
-            return True
-        else:
-            # Se houver diferença, identifica quais movimentos estão em um conjunto mas não no outro
-            bb_set = set(map(tuple, movimentos_bb))
-            trad_set = set(map(tuple, movimentos_trad_simples))
-            
-            apenas_bb = bb_set - trad_set
-            apenas_trad = trad_set - bb_set
-            
-            print(f"Validação falhou para a cor {cor}.")
-            print(f"Movimentos gerados apenas pelo método de bitboards ({len(apenas_bb)}):")
-            for m in sorted(apenas_bb):
-                print(f"  {m}")
-                
-            print(f"Movimentos gerados apenas pelo método tradicional ({len(apenas_trad)}):")
-            for m in sorted(apenas_trad):
-                print(f"  {m}")
-            
-            print(f"Total de movimentos (bitboards): {len(movimentos_bb)}")
-            print(f"Total de movimentos (tradicional): {len(movimentos_trad_simples)}")
-            
-            return False
-    
-    def imprimir_bitboard(self, bb, nome="Bitboard"):
-        """
-        Imprime uma representação visual do bitboard no formato de tabuleiro 8x8.
-        
-        Args:
-            bb: O bitboard a ser impresso
-            nome: Um nome para identificar o bitboard
-        """
-        print(f"{nome} (hex: {bb:016x}):")
-        print("  0 1 2 3 4 5 6 7")
+    def validar_movimentos_simples(self, cor: int) -> bool:
+        """Compara os resultados de gera_movimentos_simples com o método legado."""
+        movs_bit = self.gera_movimentos_simples(cor)
+        movs_legados = []
+        for mov in self.encontrar_movimentos_possiveis(cor, apenas_capturas=False):
+            if len(mov) == 2 and not self.identificar_pecas_capturadas(mov):
+                movs_legados.append((mov[0], mov[1]))
+        set_bit = set(movs_bit)
+        set_legados = set(movs_legados)
+        diffs_a = set_bit - set_legados
+        diffs_b = set_legados - set_bit
+        if diffs_a or diffs_b:
+            logger.info(f"Validação falhou para a cor {cor}.")
+            if diffs_a:
+                logger.info(f"Movimentos extras nos bitboards: {diffs_a}")
+            if diffs_b:
+                logger.info(f"Movimentos extras no legado: {diffs_b}")
+        return set_bit == set_legados
+
+    def imprimir_bitboard(self, bb: int, nome: str = "Bitboard") -> None:
+        """Imprime um bitboard no formato visual de tabuleiro (usa logger)."""
+        logger.info(f"{nome} (hex: {bb:016x}):")
+        logger.info("  0 1 2 3 4 5 6 7")
         for r in range(8):
             linha = f"{r} "
             for c in range(8):
                 idx = r * 8 + c
                 bit = (bb >> idx) & 1
                 linha += "# " if bit else ". "
-            print(linha)
-        print()
+            logger.info(linha)
+        logger.info("")
 
-    def debug_bitboards(self):
-        """Imprime todos os bitboards para depuração."""
-        self.imprimir_bitboard(self.BB_TABULEIRO_VALIDO, "Tabuleiro válido")
-        self.imprimir_bitboard(self.BB_PECAS_BRANCAS, "Peças brancas")
-        self.imprimir_bitboard(self.BB_PECAS_PRETAS, "Peças pretas")
-        self.imprimir_bitboard(self.BB_DAMAS, "Damas")
-    
-    def _inicializar_tabuleiro(self):
+    def _inicializar_tabuleiro(self) -> None:
         """Inicializa o tabuleiro com a configuração inicial de jogo."""
         # Inicializa o grid tradicional
         for i in range(8):
@@ -394,14 +351,14 @@ class Tabuleiro:
         if bb == 0:
             return 0
         return bb & -bb
-        
+
     @staticmethod
-    def clear_lsb(bb: int) -> int:
-        """Remove o bit menos significativo ligado."""
+    def idx_lsb(bb: int) -> int:
+        """Retorna o índice do bit menos significativo ligado (0-63), ou -1 se bb==0."""
         if bb == 0:
-            return 0
-        return bb & (bb - 1)
-        
+            return -1
+        return (bb & -bb).bit_length() - 1
+
     def bits_to_positions(self, bb: int) -> List[Posicao]:
         """Converte um bitboard em uma lista de posições (r,c)."""
         positions = []
@@ -411,16 +368,16 @@ class Tabuleiro:
             bb = self.clear_lsb(bb)
         return positions
 
-    def _clear_move_and_capture_cache(self):
+    def _clear_move_and_capture_cache(self) -> None:
         """Limpa apenas os caches relacionados a movimentos e capturas."""
         self.movimentos_cache.clear()
         self.capturas_cache.clear()
         
-    def limpar_cache_capturas(self):
+    def limpar_cache_capturas(self) -> None:
         """Método legado para compatibilidade, agora só limpa os caches de movimentos."""
         self._clear_move_and_capture_cache()
 
-    def configuracao_inicial(self):
+    def configuracao_inicial(self) -> None:
         # **Reinicia** os bitboards
         self.bitboard_brancas = 0
         self.bitboard_pretas = 0
@@ -493,8 +450,8 @@ class Tabuleiro:
             
         return h
 
-    def _atualizar_hash_zobrist(self, r: int, c: int, v: int):
-         if self.is_valido(r,c): self.hash_atual ^= ZOBRIST_TABELA[r][c][Peca.get_zobrist_indice(v)]
+    def _atualizar_hash_zobrist(self, r: int, c: int, v: int) -> None:
+        if self.is_valido(r,c): self.hash_atual ^= ZOBRIST_TABELA[r][c][Peca.get_zobrist_indice(v)]
 
     def _atualizar_hash_turno(self): self.hash_atual ^= ZOBRIST_VEZ_PRETA
 
@@ -519,7 +476,7 @@ class Tabuleiro:
         else:
             return VAZIO
 
-    def set_peca(self, p: Posicao, v: int):
+    def set_peca(self, p: Posicao, v: int) -> None:
         r, c = p
         if not self.is_valido(r, c):
             return
@@ -575,6 +532,21 @@ class Tabuleiro:
         """Retorna todas as posições das peças de uma determinada cor."""
         bb = self.get_pieces_by_color(cor)
         return self.bits_to_positions(bb)
+
+    @staticmethod
+    @lru_cache(maxsize=50000)
+    def _encontrar_capturas_recursivo_cached(
+        hash_atual: int, pos_a: tuple, cor: int, tipo: int, cam_a: tuple, caps_cam: tuple, visited: frozenset, damas_recem_promovidas: frozenset, depth: int
+    ) -> list:
+        # Esta função é uma versão cacheada e pura da recursão de capturas
+        # O corpo da função será adaptado da versão original, mas sem acessar self
+        # O acesso ao tabuleiro e métodos auxiliares deve ser feito via argumentos adicionais se necessário
+        # (Aqui, só esboço a assinatura e a estrutura para você adaptar o corpo conforme necessário)
+        pass
+
+    # O método original _encontrar_capturas_recursivo deve ser adaptado para chamar a versão cacheada,
+    # convertendo os argumentos mutáveis em tipos hashable e repassando o contexto necessário.
+    # Remover toda a lógica de self._cache_capturas.
 
     def _encontrar_capturas_recursivo(self, pos_a: Posicao, cor: int, tipo: int, cam_a: Movimento, caps_cam: list, visited=None, depth=0) -> List[Movimento]:
         # Monitoramento de profundidade global
@@ -1179,29 +1151,8 @@ class Tabuleiro:
         """
         Retorna True se a peça em (r, c) pode ser capturada em até 2 lances do adversário,
         considerando que o próprio jogador pode responder entre os lances do oponente.
-        
-        Versão otimizada: utiliza análise simplificada da posição em vez de busca profunda.
-        
-        Otimizações implementadas:
-        1. Cache de resultados: armazena os resultados de posições já analisadas pelo hash do tabuleiro
-           e a posição (r, c), evitando recálculos.
-        2. Verificação rápida de vulnerabilidade direta: se a peça já está vulnerável em um lance,
-           retorna True imediatamente sem mais cálculos.
-        3. Verificação de proteção: se a peça está protegida, é menos provável que seja ameaçada
-           em 2 lances, então retorna False para economizar cálculos.
-        4. Análise estatística de atacantes e defensores: em vez de fazer uma busca minimax completa 
-           de profundidade 2, analisa a presença de atacantes e defensores nas diagonais próximas.
-        5. Foco apenas nas diagonais relevantes: considera apenas as diagonais em que as peças podem
-           se mover, reduzindo o espaço de busca.
-        
-        Impacto de desempenho:
-        - Redução significativa no número de cópias de tabuleiro criadas
-        - Eliminação da busca minimax completa de profundidade 2
-        - Análise mais eficiente com heurística aproximada
-        
-        Complexidade anterior: O(m^d), onde m é o número médio de movimentos e d=2 (profundidade)
-        Complexidade atual: O(1) para casos em cache/simples, O(k) para casos complexos, 
-                           onde k é o número de diagonais verificadas (constante pequena)
+        Utiliza análise simplificada baseada em vulnerabilidade imediata, proteção e presença de atacantes/defensores próximos.
+        Resultados são cacheados para eficiência.
         """
         # Se já temos o resultado no cache, retornamos ele direto
         if not hasattr(self, '_cache_ameaca_2l'):
@@ -1218,24 +1169,18 @@ class Tabuleiro:
         cor_oponente = self.get_oponente(cor_peca)
         
         # Primeira otimização: verificar ameaça direta (em 1 lance)
-        # Se já está vulnerável em 1 lance, não precisa calcular para 2 lances
         if self.eh_peca_vulneravel(r, c):
             self._cache_ameaca_2l[key] = True
             return True
             
         # Segunda otimização: verificamos se a peça está protegida
-        # Se está protegida, a chance de ser ameaçada em 2 lances é menor
         if self.eh_peca_protegida(r, c):
             self._cache_ameaca_2l[key] = False
             return False
         
         # Terceira otimização: verificar se existem atacantes potenciais próximos
-        # Verificamos em um raio de 2 casas ao redor da peça
         atacantes_proximos = 0
         defensores_proximos = 0
-        
-        # Verificamos nas diagonais próximas (1 e 2 casas de distância)
-        # Em damas, apenas movimentos diagonais são permitidos
         diagonais_proximas = [
             (-1, -1), (-1, 1), (1, -1), (1, 1),  # 1 casa de distância
             (-2, -2), (-2, 2), (2, -2), (2, 2)   # 2 casas de distância
@@ -1248,21 +1193,15 @@ class Tabuleiro:
                 if peca != VAZIO:
                     peca_cor = Peca.get_cor(peca)
                     if peca_cor == cor_oponente:
-                        # Verificamos se é uma dama (pode mover em qualquer direção)
                         if Peca.get_tipo(peca) == DAMA:
                             atacantes_proximos += 1
-                        # Verificamos se é uma pedra com direção correta para atacar
                         elif Peca.get_tipo(peca) == PEDRA:
-                            # Pedras pretas movem para baixo (dr > 0), brancas para cima (dr < 0)
                             if (cor_oponente == PRETO and dr > 0) or (cor_oponente == BRANCO and dr < 0):
                                 atacantes_proximos += 1
                     elif peca_cor == cor_peca:
                         defensores_proximos += 1
         
-        # Se temos mais atacantes que defensores em um raio próximo,
-        # consideramos que a peça está potencialmente ameaçada em 2 lances
         result = atacantes_proximos > defensores_proximos
-        
         self._cache_ameaca_2l[key] = result
         return result
 
@@ -1513,62 +1452,7 @@ class Tabuleiro:
             print(linha)
         print("  abcdefgh")
         
-    def print_all_bitboards(self):
-        """Imprime todos os bitboards do tabuleiro."""
-        print("=== White Men ===")
-        self.print_bitboard(self.bitboard_brancas)
-        print("\n=== White Kings ===")
-        self.print_bitboard(self.bitboard_damas_brancas)
-        print("\n=== Black Men ===")
-        self.print_bitboard(self.bitboard_pretas)
-        print("\n=== Black Kings ===")
-        self.print_bitboard(self.bitboard_damas_pretas)
-        print("\n=== All Pieces ===")
-        self.print_bitboard(self.get_all_pieces())
-        print("\n=== Empty Squares ===")
-        self.print_bitboard(self.get_empty_squares())
     
-    def print_bitboards_hex(self):
-        """Imprime todos os bitboards no formato hexadecimal."""
-        print(f"White Men:   0x{self.bitboard_brancas:016X}")
-        print(f"White Kings: 0x{self.bitboard_damas_brancas:016X}")
-        print(f"Black Men:   0x{self.bitboard_pretas:016X}")
-        print(f"Black Kings: 0x{self.bitboard_damas_pretas:016X}")
-        print(f"All Pieces:  0x{self.get_all_pieces():016X}")
-        print(f"Empty Sqrs:  0x{self.get_empty_squares():016X}")
-
-    def validar_movimentos_simples(self, cor: int):
-        """Compara os resultados de gera_movimentos_simples com o método legado."""
-        # Gerar movimentos usando o novo método de bitboards
-        movs_bit = self.gera_movimentos_simples(cor)
-        
-        # Gerar movimentos usando o método legado
-        movs_legados = []
-        for mov in self.encontrar_movimentos_possiveis(cor, apenas_capturas=False):
-            # Filtrar apenas movimentos simples (sem captura)
-            if len(mov) == 2 and not self.identificar_pecas_capturadas(mov):
-                movs_legados.append((mov[0], mov[1]))
-        
-        # Verificar se ambos têm o mesmo número de movimentos
-        print(f"Movimentos via bitboards: {len(movs_bit)}")
-        print(f"Movimentos via legado: {len(movs_legados)}")
-        
-        # Converter para conjuntos para facilitar a comparação
-        set_bit = set(movs_bit)
-        set_legados = set(movs_legados)
-        
-        # Verificar se há diferenças
-        diffs_a = set_bit - set_legados
-        diffs_b = set_legados - set_bit
-        
-        if diffs_a:
-            print(f"Movimentos extras nos bitboards: {diffs_a}")
-        if diffs_b:
-            print(f"Movimentos extras no legado: {diffs_b}")
-        
-        # Retornar True se ambos são iguais
-        return set_bit == set_legados
-
     def obter_estatisticas_aspiration(self):
         """
         Dummy para compatibilidade com a interface. Retorna estatísticas vazias ou padrão.
@@ -1724,30 +1608,81 @@ class Tabuleiro:
             idx += 1
         return sum(gain)
 
+    def _validar_capturas_bitboard(self, cor: int) -> bool:
+        """
+        Valida as capturas simples de pedras (man) usando bitboards, comparando com o método tradicional.
+        Para cada peça do tipo pedra, compara os movimentos de captura possíveis via bitboard com os capturas detectadas pelo método tradicional.
+        Retorna True se todos os resultados forem idênticos, False caso contrário.
+        """
+        ok = True
+        pecas = self.get_posicoes_pecas(cor)
+        for pos in pecas:
+            peca = self.get_peca(pos)
+            if Peca.get_tipo(peca) != PEDRA:
+                continue  # Só testa para pedras
+            moves_bb, cap_bb = self.get_man_capture_moves_bitboard(pos, cor)
+            # cap_bb: dict {dest_bit: captured_bit}
+            capturas_bitboard = set()
+            for dest_bit, captured_bit in cap_bb.items():
+                origem = pos
+                destino = self.bit_to_pos(dest_bit)
+                capturada = self.bit_to_pos(captured_bit)
+                capturas_bitboard.add((origem, destino, capturada))
+            # Agora, capturas tradicionais
+            capturas_trad = set()
+            # O método tradicional retorna sequências de posições, mas para capturas simples, só interessa o primeiro salto
+            for mov in self._encontrar_capturas_recursivo(pos, cor, PEDRA, [pos], []):
+                if len(mov) == 2:
+                    origem, destino = mov
+                    # Descobrir a peça capturada
+                    dr, dc = destino[0] - origem[0], destino[1] - origem[1]
+                    capturada = (origem[0] + dr // 2, origem[1] + dc // 2)
+                    capturas_trad.add((origem, destino, capturada))
+            if capturas_bitboard != capturas_trad:
+                logger.info(f"Divergência de capturas para a peça {pos} cor {cor}:")
+                logger.info(f"  Bitboard: {capturas_bitboard}")
+                logger.info(f"  Tradicional: {capturas_trad}")
+                ok = False
+        if ok:
+            logger.info(f"Validação de capturas simples via bitboard OK para cor {cor}.")
+        else:
+            logger.info(f"Validação de capturas simples via bitboard FALHOU para cor {cor}.")
+        return ok
+
+    @staticmethod
+    def clear_lsb(bb: int) -> int:
+        """Remove o bit menos significativo ligado de um bitboard."""
+        return bb & (bb - 1)
+
 def main():
     """Função principal para testar os bitboards e a validação de movimentos."""
     tab = Tabuleiro()
     
     # Imprimir os bitboards iniciais
-    print("=== Bitboards Iniciais ===")
+    logger.info("=== Bitboards Iniciais ===")
     tab.print_bitboards_hex()
-    print("\n=== Representação Visual ===")
+    logger.info("\n=== Representação Visual ===")
     tab.print_all_bitboards()
     
     # Testar a geração de movimentos simples
-    print("\n=== Validação de Movimentos Simples ===")
-    print("Validando movimentos para BRANCO:")
+    logger.info("\n=== Validação de Movimentos Simples ===")
+    logger.info("Validando movimentos para BRANCO:")
     tab.validar_movimentos_simples(BRANCO)
     
-    print("\nValidando movimentos para PRETO:")
+    logger.info("\nValidando movimentos para PRETO:")
     tab.validar_movimentos_simples(PRETO)
     
     # Mostrar exemplo de movimentos gerados
-    print("\n=== Exemplo de Movimentos Simples para BRANCO ===")
+    logger.info("\n=== Exemplo de Movimentos Simples para BRANCO ===")
     movs_branco = tab.gera_movimentos_simples(BRANCO)
     for i, (origem, destino) in enumerate(movs_branco[:5]):  # Mostrar apenas os 5 primeiros
-        print(f"Movimento {i+1}: {origem} -> {destino}")
-    
-    if __name__ == "__main__":
-        main()
+        logger.info(f"Movimento {i+1}: {origem} -> {destino}")
+
+    # Testar a validação de capturas simples via bitboards
+    logger.info("\n=== Validação de Capturas Simples via Bitboards ===")
+    tab._validar_capturas_bitboard(BRANCO)
+    tab._validar_capturas_bitboard(PRETO)
+
+if __name__ == "__main__":
+    main()
     
