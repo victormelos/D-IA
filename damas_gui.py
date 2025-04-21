@@ -7,13 +7,17 @@ import time
 import traceback  # Importar o módulo traceback
 from threading import Thread
 from typing import List, Tuple, Optional, Dict, Set
+import logging
 
 # Importa a lógica do jogo
 from damas_logic import (
     Tabuleiro, Partida, MotorIA, Peca, Movimento, Posicao,
     BRANCO, PRETO, VAZIO, PEDRA, DAMA,
-    TAMANHO_TABULEIRO, PROFUNDIDADE_IA, TEMPO_PADRAO_IA, TempoExcedidoError # Importar novas constantes
+    TAMANHO_TABULEIRO, PROFUNDIDADE_IA, TEMPO_PADRAO_IA, TempoExcedidoError
 )
+from damas_logic import logger
+# Adiciona o import do visualizador de debug
+from debug_visual import draw_debug_info, draw_debug_panel, render_log_panel
 
 # --- Constantes ---
 # PROFUNDIDADE_GUI = 10 # Não mais necessário, usa da lógica
@@ -236,10 +240,23 @@ def main():
     movimento_sugerido_ia: Optional[Movimento] = None; calculando_sugestao: bool = False; thread_calculo: Optional[Thread] = None
     resultado_calculo: dict = {'movimento': None, 'status': None, 'status_aspiration': None, 'reuso_info': None}; precisa_calcular_sugestao = (partida.jogador_atual == BRANCO)
     mensagem_info = ""; rodando = True
+    scroll_offset = 0  # Para rolagem do painel lateral
 
     # Adicionar nova mensagem de ajuda sobre a tecla 'i'
     if resultado_calculo.get('status_aspiration'):
         mensagem_info = "Pressione 'I' para ver estatísticas de Aspiration Windows"
+
+    log_lines = []  # Lista para armazenar logs
+
+    # Handler customizado para capturar logs
+    class GuiLogHandler(logging.Handler):
+        def emit(self, record):
+            msg = self.format(record)
+            log_lines.append(msg)
+    gui_handler = GuiLogHandler()
+    gui_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    if not any(isinstance(h, GuiLogHandler) for h in logger.handlers):
+        logger.addHandler(gui_handler)
 
     while rodando:
         # Atualizar Mensagem
@@ -339,6 +356,20 @@ def main():
                                 else: peca_selecionada_pos=None; movimentos_validos_selecionada=[]; destinos_possiveis_selecionada=[]
                             else: peca_selecionada_pos=None; movimentos_validos_selecionada=[]; destinos_possiveis_selecionada=[]
                 # else: Clicou fora
+            # Suporte à rolagem do painel lateral
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 4:  # Scroll up
+                    scroll_offset = max(scroll_offset - 30, 0)
+                elif event.button == 5:  # Scroll down
+                    scroll_offset = scroll_offset + 30
+            # Toggle de verbosidade do logger com a tecla 'V'
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_v:
+                if logger.level == logging.DEBUG:
+                    logger.setLevel(logging.INFO)
+                    print("[DEBUG] Logger set to INFO (modo silencioso)")
+                else:
+                    logger.setLevel(logging.DEBUG)
+                    print("[DEBUG] Logger set to DEBUG (modo verboso)")
 
         if not rodando: break
 
@@ -348,7 +379,36 @@ def main():
         desenhar_destaques(tela, peca_selecionada_pos, destinos_possiveis_selecionada)
         desenhar_pecas(tela, partida.tabuleiro)
         if not calculando_sugestao and partida.jogador_atual == BRANCO: desenhar_linha_sugestao_ia(tela, movimento_sugerido_ia)
-        
+
+        # === DEBUG VISUAL SOBRE O TABULEIRO ===
+        partida.tabuleiro.avaliar_heuristica(BRANCO, debug_aval=True)
+        debug_info = getattr(partida.tabuleiro, '_last_debug_info', [])
+        draw_debug_info(
+            tela,
+            debug_info,
+            TAMANHO_QUADRADO,
+            (MARGIN_X, MARGIN_Y)
+        )
+        # Painel lateral detalhado com scroll
+        draw_debug_panel(
+            tela,
+            debug_info,
+            TAMANHO_QUADRADO,
+            (MARGIN_X, MARGIN_Y),
+            ALTURA_TELA,
+            scroll_offset
+        )
+        # Painel de logs ao lado do painel de debug
+        render_log_panel(
+            tela,
+            log_lines,
+            MARGIN_X + TAMANHO_QUADRADO * 8 + 20 + 340 + 10,  # x0: após painel de debug
+            MARGIN_Y,                                         # y0
+            340,                                              # largura
+            ALTURA_TELA                                       # altura
+        )
+        # ======================================
+
         # Adicionar dica sobre a tecla 'i' quando estatísticas estiverem disponíveis
         if not calculando_sugestao and ia_assistente.obter_estatisticas_aspiration()['janelas_usadas']:
             mensagem_info += " (I: Estatísticas)"
