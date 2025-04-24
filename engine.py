@@ -309,16 +309,17 @@ def alpha_beta(
 # ————————————————
 def suggest_move(
     board: Board,
-    max_depth: int = 6
+    max_depth: int = 6,
+    player: Color = Color.WHITE
 ) -> Optional[Move]:
     """
     Executa profundidades de 1 até max_depth e retorna o melhor Move encontrado
-    para as brancas (sempre chamamos no turno das brancas).
+    para o jogador especificado (padrão: brancas).
     """
     tt = {}
     best: Optional[Move] = None
     for d in range(1, max_depth + 1):
-        _, mv = alpha_beta(board, d, -math.inf, math.inf, Color.WHITE, tt)
+        _, mv = alpha_beta(board, d, -math.inf, math.inf, player, tt)
         if mv is not None:
             best = mv
     return best
