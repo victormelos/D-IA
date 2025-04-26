@@ -168,13 +168,19 @@ def generate_moves(board: Board, player: Color) -> List[Move]:
 def apply_move(board: Board, move: Move) -> Board:
     """
     Aplica um movimento (simples ou com captura) e retorna novo Board.
-    Promoções de homens a damas são tratadas automaticamente.
+    Promoções de homens a damas são tratadas automaticamente, preservando damas.
     """
     w_bb, b_bb = board.bitboard_white, board.bitboard_black
-    w_k, b_k   = board.kings_white, board.kings_black
+    w_k,  b_k  = board.kings_white, board.kings_black
 
     origin = move.path[0]
     is_white = ((w_bb >> origin) & 1) == 1
+
+    # grava se era dama antes de limpar
+    if is_white:
+        was_king = ((w_k >> origin) & 1) == 1
+    else:
+        was_king = ((b_k >> origin) & 1) == 1
 
     # remove origem
     if is_white:
@@ -197,15 +203,13 @@ def apply_move(board: Board, move: Move) -> Board:
     dest = move.path[-1]
     if is_white:
         w_bb |= (1 << dest)
-        # promoção: homens viram damas ao chegar na última linha (linha 7);
-        # damas mantêm o status
-        if dest // 4 == 7 or ((w_k >> origin) & 1):
+        # preserva dama se já era, ou promove ao chegar na última linha
+        if was_king or dest // 4 == 7:
             w_k |= (1 << dest)
     else:
         b_bb |= (1 << dest)
-        # promoção: homens viram damas ao chegar na primeira linha (linha 0);
-        # damas mantêm o status
-        if dest // 4 == 0 or ((b_k >> origin) & 1):
+        # preserva dama se já era, ou promove ao chegar na primeira linha
+        if was_king or dest // 4 == 0:
             b_k |= (1 << dest)
 
     return Board(w_bb, b_bb, w_k, b_k)
@@ -309,16 +313,17 @@ def alpha_beta(
 # ————————————————
 def suggest_move(
     board: Board,
-    max_depth: int = 6
+    max_depth: int = 6,
+    player: Color = Color.WHITE
 ) -> Optional[Move]:
     """
     Executa profundidades de 1 até max_depth e retorna o melhor Move encontrado
-    para as brancas (sempre chamamos no turno das brancas).
+    para o jogador especificado (padrão: brancas).
     """
     tt = {}
     best: Optional[Move] = None
     for d in range(1, max_depth + 1):
-        _, mv = alpha_beta(board, d, -math.inf, math.inf, Color.WHITE, tt)
+        _, mv = alpha_beta(board, d, -math.inf, math.inf, player, tt)
         if mv is not None:
             best = mv
     return best
