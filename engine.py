@@ -4,6 +4,12 @@ from board import Board
 from move import Move
 import math
 
+# contador de nós de busca
+nodes = 0
+
+# flag para ligar/desligar quiescence
+USE_QUIESCENCE = True
+
 class Color(Enum):
     WHITE = 1
     BLACK = 2
@@ -226,6 +232,37 @@ def evaluate(board: Board) -> float:
 
     return (white_men + 1.5*white_kings) - (black_men + 1.5*black_kings)
 
+# Adiciona busca quiescente para evitar o horizon effect
+def quiesce(board: Board, alpha: float, beta: float, player: Color) -> float:
+    """
+    Quiescence search: estende a busca em posições com capturas pendentes
+    para evitar o *horizon effect*.
+    """
+    global nodes
+    nodes += 1
+    # 1) Avaliação estática da posição "quieta"
+    stand_pat = evaluate(board)
+
+    # 2) Corte de stand-pat
+    if stand_pat >= beta:
+        return beta
+    if alpha < stand_pat:
+        alpha = stand_pat
+
+    # 3) Gerar apenas movimentos de captura
+    captures = [m for m in generate_moves(board, player) if m.is_capture()]
+    # 4) Explorar cada captura em modo negamax
+    for m in captures:
+        next_board = apply_move(board, m)
+        opponent = Color.WHITE if player == Color.BLACK else Color.BLACK
+        score = -quiesce(next_board, -beta, -alpha, opponent)
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+
+    return alpha
+
 # ————————————————
 # Transposition Table
 # ————————————————
@@ -253,9 +290,14 @@ def alpha_beta(
     Retorna (valor, melhor_move) usando poda Alpha-Beta.
     Armazena resultados em 'tt' para reaproveitar posições.
     """
+    global nodes
+    nodes += 1
     # nó terminal
     if depth == 0:
-        return evaluate(board), None
+        if USE_QUIESCENCE:
+            return quiesce(board, alpha, beta, player), None
+        else:
+            return evaluate(board), None
 
     key = (*_board_key(board), player)
     # veja se já temos essa posição em profundidade >= depth
