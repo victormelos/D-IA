@@ -17,7 +17,7 @@ HISTORY_CUTOFF_BONUS = lambda d: d*d
 # ----------------------------
 
 # profundidade máxima de busca padrão
-MAX_SEARCH_DEPTH = 10
+MAX_SEARCH_DEPTH = 15
 
 # contador de nós de busca
 nodes = 0
@@ -238,15 +238,32 @@ def apply_move(board: Board, move: Move) -> Board:
 
     # coloca na casa destino
     dest = move.path[-1]
+    # determina fila de destino e se está na back-rank para promoção
+    row_dest, _ = Board.index_to_coords(dest)
+    at_back_rank_now = (row_dest == 7 and is_white) or (row_dest == 0 and not is_white)
     if is_white:
+        # coloca peça branca no destino
         w_bb |= (1 << dest)
-        # preserva dama se já era, ou promove ao chegar na última linha
-        if was_king or dest // 4 == 7:
+        if was_king:
+            # já era dama
+            w_k |= (1 << dest)
+        elif at_back_rank_now and not move.is_capture():
+            # promoção por movimento simples na back rank
+            w_k |= (1 << dest)
+        elif at_back_rank_now and move.is_capture():
+            # promoção ao final de sequência de capturas em back rank
             w_k |= (1 << dest)
     else:
+        # coloca peça preta no destino
         b_bb |= (1 << dest)
-        # preserva dama se já era, ou promove ao chegar na primeira linha
-        if was_king or dest // 4 == 0:
+        if was_king:
+            # já era dama
+            b_k |= (1 << dest)
+        elif at_back_rank_now and not move.is_capture():
+            # promoção por movimento simples na back rank (primeira linha)
+            b_k |= (1 << dest)
+        elif at_back_rank_now and move.is_capture():
+            # promoção ao final de sequência de capturas na back rank
             b_k |= (1 << dest)
 
     return Board(w_bb, b_bb, w_k, b_k)
@@ -497,21 +514,18 @@ def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) 
     # futility pruning + LMR + killer updates
     for move_idx, mv in enumerate(moves):
         next_board = apply_move(board, mv)
-        # apenas se não estivermos em final curto (menos de 6 peças) e lance simples
-        if depth <= FUTILITY_DEPTH and not mv.is_capture() and total_pieces >= 6:
-            static_val = eval_side(next_board, player)
-            if static_val <= alpha_orig - FUTILITY_MARGIN:
-                continue
-        # Late Move Reduction: lances não-capture não-killer após 8 testes em profundidade ≥3
-        if (not mv.is_capture()) and (mv not in KILLER[depth]) and move_idx >= 8 and depth >= 3:
-            val, _ = negamax(next_board, depth - 2, -beta, -alpha, opponent)
-            val = -val
-            if val > alpha:
-                val, _ = negamax(next_board, depth - 1, -beta, -alpha, opponent)
-                val = -val
-        else:
+        if move_idx == 0:
+            # pesquisa com janela cheia
             val, _ = negamax(next_board, depth - 1, -beta, -alpha, opponent)
             val = -val
+        else:
+            # pesquisa com janela nula
+            val, _ = negamax(next_board, depth - 1, -alpha - 1, -alpha, opponent)
+            val = -val
+            # se falha alta, re‐pesquisa janela cheia
+            if alpha < val < beta:
+                val, _ = negamax(next_board, depth - 1, -beta, -alpha, opponent)
+                val = -val
         if val > best_val:
             best_val, best_move = val, mv
         alpha = max(alpha, val)
