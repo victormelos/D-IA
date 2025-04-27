@@ -1,7 +1,11 @@
 # test_quiescence.py
+import sys, pathlib
+# garante que a raiz do projeto esteja no PYTHONPATH para importar engine
+sys.path.append(str(pathlib.Path(__file__).resolve().parent.parent))
 import engine
 from board import Board
 from engine import suggest_move, Color
+import utils
 
 
 def make_test_board() -> Board:
@@ -35,18 +39,22 @@ def run_test(use_quiescence: bool, board: Board, label: str = ""):
     # reinicia contador e configura quiescence
     engine.nodes = 0
     engine.USE_QUIESCENCE = use_quiescence
-    move = suggest_move(board, max_depth=2, player=Color.WHITE)
-    print(f"{label} USE_QUIESCENCE={use_quiescence!s:5}  move={move!s:25}  nodes={engine.nodes}")
+    depth = 2
+    move = suggest_move(board, max_depth=depth, player=Color.WHITE)
+    print(f"{label} d={depth} USE_QUIESCENCE={use_quiescence!s:5}  move={move!s:25}  nodes={engine.nodes}")
 
 
 if __name__ == "__main__":
+    utils.DEBUG = True
     # Teste de captura múltipla
     test_board = make_test_board()
     print("=== TESTE CAPTURA MÚLTIPLA ===")
     run_test(False, test_board, "SEM QUIESCENCE:")
     run_test(True,  test_board, "COM QUIESCENCE:")
+    print("-" * 60)
 
     # Teste de regressão (sem capturas)
     quiet_board = make_quiet_board()
     print("\n=== TESTE REGRESSÃO (sem capturas) ===")
-    run_test(True, quiet_board, "REGRESSÃO:") 
+    run_test(True, quiet_board, "REGRESSÃO:")
+    print("-" * 60) 
