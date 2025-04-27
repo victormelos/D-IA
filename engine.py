@@ -3,6 +3,48 @@ from enum import Enum
 from board import Board
 from move import Move
 import math
+from utils import debug_move, DEBUG
+
+# --- PARÂMETROS DE TUNING ---
+PST_WEIGHT           = 0.02
+BORDER_PST_FACTOR    = 0.5
+MOBILITY_WEIGHT      = 0.1
+FUTILITY_DEPTH       = 0
+FUTILITY_MARGIN      = 0.01
+ENDGAME_PIECE_LIMIT  = 8
+ENDGAME_MULTIPLIER   = 1.0
+HISTORY_CUTOFF_BONUS = lambda d: d*d
+# ----------------------------
+
+# profundidade máxima de busca padrão
+MAX_SEARCH_DEPTH = 10
+
+# contador de nós de busca
+nodes = 0
+
+# flag para ligar/desligar quiescence
+USE_QUIESCENCE = True
+
+# valores para MVV-LVA
+PIECE_VALUES = {
+    'man': 100,
+    'king': 150
+}
+
+# valores em "centavos" (ou unidades) para cada casa 0–31
+PSQT_MAN = [
+    0,  0,  0,  0,   0,  5,  5,  0,
+    0, 10, 15, 10,  10, 15, 10,  0,
+    0, 15, 20, 15,  15, 20, 15,  0,
+    0, 10, 15, 10,  10, 15, 10,  0
+]
+
+PSQT_KING = [
+    0,  0,  0,  0,   0,  2,  2,  0,
+    0,  5, 10,  5,   5, 10,  5,  0,
+    0, 10, 15, 10,  10, 15, 10,  0,
+    0,  5, 10,  5,   5, 10,  5,  0
+]
 
 class Color(Enum):
     WHITE = 1
@@ -214,22 +256,91 @@ def apply_move(board: Board, move: Move) -> Board:
 
     return Board(w_bb, b_bb, w_k, b_k)
 
-def evaluate(board: Board) -> float:
+def evaluate_material_only(board: Board) -> float:
+    # material: 1.0 por man, 1.5 por king
+    wm = bin(board.bitboard_white & ~board.kings_white).count("1")
+    wk = bin(board.kings_white).count("1")
+    bm = bin(board.bitboard_black & ~board.kings_black).count("1")
+    bk = bin(board.kings_black).count("1")
+    return (wm + 1.5*wk) - (bm + 1.5*bk)
+
+def evaluate(board: Board, move_cache: Optional[Dict[Color, List[Move]]] = None) -> float:
     """
-    Heurística simples: diferença de material
-    (1 ponto por homem, 1.5 por dama).
+    Heurística simples: diferença de material com bônus de posição e mobilidade.
+    Se move_cache for fornecido, usa-o para calcular mobilidade sem gerar movimentos novamente.
     """
     white_men   = bin(board.bitboard_white & ~board.kings_white).count("1")
     white_kings = bin(board.kings_white).count("1")
     black_men   = bin(board.bitboard_black & ~board.kings_black).count("1")
     black_kings = bin(board.kings_black).count("1")
 
-    return (white_men + 1.5*white_kings) - (black_men + 1.5*black_kings)
+    # base de material
+    score = (white_men + 1.5 * white_kings) - (black_men + 1.5 * black_kings)
+    # PST com peso maior e penalidade em bordas
+    for idx in range(32):
+        row, col = Board.index_to_coords(idx)
+        border = row in (0, 7) or col in (0, 7)
+        bit = 1 << idx
+        if board.bitboard_white & bit:
+            pst_val = PSQT_KING[idx] if (board.kings_white & bit) else PSQT_MAN[idx]
+            weight = PST_WEIGHT * (BORDER_PST_FACTOR if border else 1.0)
+            score += pst_val * weight
+        if board.bitboard_black & bit:
+            pst_val = PSQT_KING[idx] if (board.kings_black & bit) else PSQT_MAN[idx]
+            weight = PST_WEIGHT * (BORDER_PST_FACTOR if border else 1.0)
+            score -= pst_val * weight
 
-# ————————————————
-# Transposition Table
-# ————————————————
-# Chave simples: tupla dos quatro bitboards
+    # mobilidade: usa cache se disponível
+    if move_cache is not None:
+        white_moves = len(move_cache[Color.WHITE])
+        black_moves = len(move_cache[Color.BLACK])
+    else:
+        white_moves = len(generate_moves(board, Color.WHITE))
+        black_moves = len(generate_moves(board, Color.BLACK))
+    score += (white_moves - black_moves) * MOBILITY_WEIGHT
+
+    # Endgame material bonus
+    total_pieces = white_men + white_kings + black_men + black_kings
+    if total_pieces < ENDGAME_PIECE_LIMIT:
+        score *= ENDGAME_MULTIPLIER
+    return score
+
+def eval_side(board: Board, player: Color) -> float:
+    """Avalia a posição do ponto de vista de `player`."""
+    base = evaluate(board)
+    return base if player == Color.WHITE else -base
+
+def mvv_lva_score(move: Move, board: Board, player: Color) -> int:
+    """
+    Retorna um escore para ordenar capturas:
+    valor_da_vitima menos valor_do_atacante.
+    """
+    if not move.is_capture():
+        return 0
+    # a vítima mais valiosa
+    victim_idxs = move.captured
+    opp_kings = board.kings_black if player == Color.WHITE else board.kings_white
+    max_victim_value = max(
+        PIECE_VALUES['king'] if (opp_kings >> mid) & 1 else PIECE_VALUES['man']
+        for mid in victim_idxs
+    )
+    # atacante
+    origin = move.path[0]
+    our_kings = board.kings_white if player == Color.WHITE else board.kings_black
+    attacker_value = PIECE_VALUES['king'] if (our_kings >> origin) & 1 else PIECE_VALUES['man']
+    return max_victim_value - attacker_value
+
+# tipos de bound para Negamax e quiescence
+class BoundType(Enum):
+    EXACT = 1
+    LOWER = 2
+    UPPER = 3
+
+# tabela global de transposição: key->(depth, value, bound, best_move)
+TT: Dict[Tuple[int,int,int,int,Color], Tuple[int, float, BoundType, Optional[Move]]] = {}
+# history heuristic: map (origem, destino) to score
+HISTORY: Dict[Tuple[int,int], int] = {}
+
 def _board_key(board: Board) -> Tuple[int,int,int,int]:
     return (
         board.bitboard_white,
@@ -238,92 +349,155 @@ def _board_key(board: Board) -> Tuple[int,int,int,int]:
         board.kings_black
     )
 
-# ————————————————
-# Alpha-Beta Poda
-# ————————————————
-def alpha_beta(
-    board: Board,
-    depth: int,
-    alpha: float,
-    beta: float,
-    player: Color,
-    tt: dict
-) -> Tuple[float, Optional[Move]]:
+def has_forced_capture(board: Board, player: Color) -> bool:
     """
-    Retorna (valor, melhor_move) usando poda Alpha-Beta.
-    Armazena resultados em 'tt' para reaproveitar posições.
+    Retorna True se há pelo menos uma captura obrigatória para `player`.
     """
-    # nó terminal
-    if depth == 0:
-        return evaluate(board), None
-
-    key = (*_board_key(board), player)
-    # veja se já temos essa posição em profundidade >= depth
-    if key in tt:
-        stored_depth, stored_val, stored_move = tt[key]
-        if stored_depth >= depth:
-            return stored_val, stored_move
-
     moves = generate_moves(board, player)
-    if not moves:
-        # Se não há movimentos, é posição terminal: vitória do adversário
-        return (math.inf, None) if player == Color.BLACK else (-math.inf, None)
+    return bool(moves and moves[0].is_capture())
 
-    best_move: Optional[Move] = None
+def is_quiet(board: Board, player: Color) -> bool:
+    """
+    Retorna True se NÃO há capturas obrigatórias para `player` (posição 'quieta').
+    """
+    return not has_forced_capture(board, player)
 
-    if player == Color.WHITE:
-        value = -math.inf
-        for mv in moves:
-            vb, _ = alpha_beta(
-                apply_move(board, mv),
-                depth - 1,
-                alpha,
-                beta,
-                Color.BLACK,
-                tt
-            )
-            if vb > value:
-                value, best_move = vb, mv
-            alpha = max(alpha, value)
+# Quiescence search minimal (Qsearch) para trocas e capturas
+def qsearch(board: Board, alpha: float, beta: float, player: Color) -> float:
+    global nodes
+    nodes += 1
+    # avaliação estática para o jogador
+    stand_pat = eval_side(board, player)
+    # cortes alpha-beta clássicos
+    if stand_pat >= beta:
+        return beta
+    if alpha < stand_pat:
+        alpha = stand_pat
+    # gera apenas movimentos de captura
+    captures = [m for m in generate_moves(board, player) if m.is_capture()]
+    # explora capturas em recusa negamax
+    for m in captures:
+        next_b = apply_move(board, m)
+        opponent = Color.WHITE if player == Color.BLACK else Color.BLACK
+        score = -qsearch(next_b, -beta, -alpha, opponent)
+        # logging padronizado (forçado)
+        debug_move(0, m, score, True)
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+    return alpha
+
+def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) -> Tuple[float, Optional[Move]]:
+    """Retorna (valor, melhor_move) usando Negamax + Poda Alpha-Beta."""
+    global nodes, TT
+    nodes += 1
+    # guardo α e β originais antes de qualquer modificação em α
+    alpha_orig, beta_orig = alpha, beta
+    # Transposition Table lookup
+    key = (*_board_key(board), player)
+    if key in TT:
+        d_stored, val_stored, bound_stored, mv_stored = TT[key]
+        if d_stored >= depth:
+            if bound_stored == BoundType.EXACT:
+                return val_stored, mv_stored
+            elif bound_stored == BoundType.LOWER:
+                alpha = max(alpha, val_stored)
+            else:
+                beta = min(beta, val_stored)
             if alpha >= beta:
-                break
-    else:  # vez das pretas
-        value = math.inf
-        for mv in moves:
-            vb, _ = alpha_beta(
-                apply_move(board, mv),
-                depth - 1,
-                alpha,
-                beta,
-                Color.WHITE,
-                tt
+                return val_stored, mv_stored
+
+    # nó terminal ─────────────────────────────────────────────────
+    if depth == 0:
+        # quiescence somente se habilitado e posição quieta
+        if USE_QUIESCENCE and is_quiet(board, player):
+            val = qsearch(board, alpha, beta, player)
+        else:
+            val = eval_side(board, player)
+        return val, None
+
+    # gera e ordena movimentos (MVV-LVA)
+    moves = generate_moves(board, player)
+    move_cache = {
+        Color.WHITE: moves, 
+        Color.BLACK: generate_moves(board, Color.BLACK if player == Color.WHITE else Color.WHITE)
+    }
+    score = evaluate(board, move_cache)
+    # SEE DEBUG (temporariamente desativado): imprimindo quando haveria forced capture
+    filtered_moves: List[Move] = []
+    opponent = Color.BLACK if player == Color.WHITE else Color.WHITE
+    for mv in moves:
+        if mv.is_capture():
+            filtered_moves.append(mv)
+        else:
+            b2 = apply_move(board, mv)
+            # verifica se haveria captura forçada em mv.path[-1]
+            forced = any(
+                opp_mv.is_capture() and mv.path[-1] in opp_mv.captured
+                for opp_mv in generate_moves(b2, opponent)
             )
-            if vb < value:
-                value, best_move = vb, mv
-            beta = min(beta, value)
-            if beta <= alpha:
-                break
+            if forced:
+                debug_move(depth, mv, score, forced)
+            # mantém todos os movimentos (não descarto mais)
+            filtered_moves.append(mv)
+    moves = filtered_moves
+    # ordena movimentos: capturas primeiro, por mvv-lva (calculado só para capturas), history heuristic e PSQT
+    moves.sort(
+        key=lambda mv: (
+            -int(mv.is_capture()),
+            -(mvv_lva_score(mv, board, player) if mv.is_capture() else 0),
+            -HISTORY.get((mv.path[0], mv.path[-1]), 0),
+            0 if mv.is_capture() else -PSQT_MAN[mv.path[-1]]
+        )
+    )
 
-    # armazena na tabela de transposição
-    tt[key] = (depth, value, best_move)
-    return value, best_move
+    best_val = -math.inf
+    best_move: Optional[Move] = None
+    # futility pruning: descarta moves simples em profundidade rasa usando alpha original para evitar não-determinismo
+    for mv in moves:
+        next_board = apply_move(board, mv)
+        if depth <= FUTILITY_DEPTH and not mv.is_capture():
+            # futility pruning usando avaliação do lado atual para consistência
+            static_val = eval_side(next_board, player)
+            if static_val <= alpha_orig - FUTILITY_MARGIN:
+                continue
+        val, _ = negamax(next_board, depth - 1, -beta, -alpha, opponent)
+        val = -val
+        if val > best_val:
+            best_val, best_move = val, mv
+        alpha = max(alpha, val)
+        if alpha >= beta:
+            # history heuristic: penaliza movimentos não-capture que causam cutoff (ranking positivo)
+            if not mv.is_capture():
+                key_move = (mv.path[0], mv.path[-1])
+                HISTORY[key_move] = HISTORY.get(key_move, 0) + HISTORY_CUTOFF_BONUS(depth)
+            break
 
-# ————————————————
-# Iterative Deepening
-# ————————————————
-def suggest_move(
-    board: Board,
-    max_depth: int = 6,
-    player: Color = Color.WHITE
-) -> Optional[Move]:
-    """
-    Executa profundidades de 1 até max_depth e retorna o melhor Move encontrado
-    para o jogador especificado (padrão: brancas).
-    """
-    tt = {}
-    best: Optional[Move] = None
+    # Armazena resultado na Transposition Table
+    if best_val <= alpha_orig:
+        bound_type = BoundType.UPPER
+    elif best_val >= beta_orig:
+        bound_type = BoundType.LOWER
+    else:
+        bound_type = BoundType.EXACT
+    TT[key] = (depth, best_val, bound_type, best_move)
+    # history heuristic: reforça movimento que foi efetivamente escolhido
+    if best_move is not None and not best_move.is_capture():
+        key_best = (best_move.path[0], best_move.path[-1])
+        HISTORY[key_best] = HISTORY.get(key_best, 0) + HISTORY_CUTOFF_BONUS(depth)
+    return best_val, best_move
+
+def suggest_move(board: Board, max_depth: int = MAX_SEARCH_DEPTH, player: Color = Color.WHITE, debug: bool = False) -> Optional[Move]:
+    """Se debug=True, imprime para cada profundidade quantos nós foram buscados e o melhor movimento."""
+    best_move: Optional[Move] = None
     for d in range(1, max_depth + 1):
-        _, mv = alpha_beta(board, d, -math.inf, math.inf, player, tt)
+        if debug:
+            start_nodes = nodes
+        value, mv = negamax(board, d, -math.inf, math.inf, player)
+        if debug:
+            nodes_searched = nodes - start_nodes
+            print(f"[DEBUG] Depth={d}: nodes={nodes_searched}, best_move={mv}, value={value:.2f}")
         if mv is not None:
-            best = mv
-    return best
+            best_move = mv
+    return best_move

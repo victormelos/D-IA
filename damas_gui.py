@@ -27,12 +27,16 @@ class DamasGUI:
         self.board = Board.initial()
         self.selected = None
         self.turn = Color.WHITE
+        # histórico de estados para desfazer
+        self.history = []
         self.canvas.bind("<Button-1>", self.on_click)
         self.draw_board()
         self.status = tk.Label(master, text="Turno: Pretas")
         self.status.pack()
         self.ai_button = tk.Button(master, text="Sugestão IA", command=self.ai_move)
         self.ai_button.pack()
+        self.undo_button = tk.Button(master, text="Desfazer", command=self.undo_move)
+        self.undo_button.pack()
 
     def draw_board(self):
         self.canvas.delete("all")
@@ -107,6 +111,8 @@ class DamasGUI:
             for m in moves:
                 if m.path[0] == self.selected and m.path[-1] == idx:
                     # executa movimentação do humano
+                    # salva estado antes de mover
+                    self.history.append((self.board, self.turn))
                     self.board = apply_move(self.board, m)
                     self.selected = None
                     # passa a vez para a IA (pretas)
@@ -128,11 +134,23 @@ class DamasGUI:
             start, end = suggestion.path[0], suggestion.path[-1]
             msg = f"IA sugere mover de {start} para {end}."
             if messagebox.askyesno("Movimento da IA", msg+"\nExecutar?"):
+                # salva estado antes de mover pela IA
+                self.history.append((self.board, self.turn))
                 self.board = apply_move(self.board, suggestion)
                 self.draw_board()
         # volta a vez para o jogador (brancas)
         self.turn = Color.WHITE
         self.status.config(text="Turno: Brancas")
+
+    def undo_move(self):
+        """Desfaz a última jogada, retornando ao estado anterior."""
+        if not self.history:
+            return
+        board, turn = self.history.pop()
+        self.board = board
+        self.turn = turn
+        self.draw_board()
+        self.status.config(text=f"Turno: {'Brancas' if self.turn == Color.WHITE else 'Pretas'}")
 
 if __name__ == "__main__":
     root = tk.Tk()
