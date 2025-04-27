@@ -432,20 +432,26 @@ def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) 
         return val, None
 
     # gera e ordena movimentos (MVV-LVA)
-    cache_key = (*key, player)
+    cache_key = key  # já inclui o player, sem duplicar
     if cache_key not in move_cache_local:
         move_cache_local[cache_key] = generate_moves(board, player)
     moves = move_cache_local[cache_key]
-    # cache de movimentos: mapeia corretamente por jogador
+    # cache de movimentos do oponente para evitar gerar duas vezes
+    opponent = Color.BLACK if player == Color.WHITE else Color.WHITE
+    opp_key = (*_board_key(board), opponent)
+    if opp_key not in move_cache_local:
+        move_cache_local[opp_key] = generate_moves(board, opponent)
+    opp_moves = move_cache_local[opp_key]
+    # cache de movimentos: mapeia corretamente por jogador usando opp_moves
     if player == Color.WHITE:
         move_cache = {
             Color.WHITE: moves,
-            Color.BLACK: generate_moves(board, Color.BLACK)
+            Color.BLACK: opp_moves
         }
     else:
         move_cache = {
             Color.BLACK: moves,
-            Color.WHITE: generate_moves(board, Color.WHITE)
+            Color.WHITE: opp_moves
         }
     if DEBUG:
         score = evaluate(board, move_cache)
@@ -545,6 +551,7 @@ def suggest_move(board: Board, max_depth: int = MAX_SEARCH_DEPTH, player: Color 
     for lst in KILLER:
         lst[0] = lst[1] = None
     HISTORY.clear()
+    move_cache_local.clear()   # limpa cache de movimentos entre partidas
     ENDGAME_K = endgame_k
     nodes = 0   # reset do contador de nós para cada chamada
     window = 0.5      # meio peão (±50 centipawns)
