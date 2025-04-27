@@ -32,7 +32,7 @@ def make_quiet_board() -> Board:
     return Board(w_bb, b_bb, w_k, b_k)
 
 
-def run_test(use_quiescence: bool, board: Board, label: str = ""):
+def run_test(use_quiescence: bool, board: Board, label: str = "", endgame_k: float = None):
     """
     Executa suggest_move em board com/sem quiescence e imprime move e nodes.
     """
@@ -40,7 +40,10 @@ def run_test(use_quiescence: bool, board: Board, label: str = ""):
     engine.nodes = 0
     engine.USE_QUIESCENCE = use_quiescence
     depth = 2
-    move = suggest_move(board, max_depth=depth, player=Color.WHITE)
+    if endgame_k is not None:
+        move = suggest_move(board, max_depth=depth, player=Color.WHITE, endgame_k=endgame_k)
+    else:
+        move = suggest_move(board, max_depth=depth, player=Color.WHITE)
     print(f"{label} d={depth} USE_QUIESCENCE={use_quiescence!s:5}  move={move!s:25}  nodes={engine.nodes}")
 
 
@@ -49,12 +52,12 @@ if __name__ == "__main__":
     # Teste de captura múltipla
     test_board = make_test_board()
     print("=== TESTE CAPTURA MÚLTIPLA ===")
-    run_test(False, test_board, "SEM QUIESCENCE:")
-    run_test(True,  test_board, "COM QUIESCENCE:")
+    run_test(False, test_board, "SEM QUIESCENCE:", endgame_k=1.0)
+    run_test(True,  test_board, "COM QUIESCENCE:", endgame_k=1.0)
     print("-" * 60)
 
     # Teste de regressão (sem capturas)
     quiet_board = make_quiet_board()
     print("\n=== TESTE REGRESSÃO (sem capturas) ===")
-    run_test(True, quiet_board, "REGRESSÃO:")
+    run_test(True, quiet_board, "REGRESSÃO:", endgame_k=1.0)
     print("-" * 60) 

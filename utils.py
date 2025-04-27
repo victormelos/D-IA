@@ -2,8 +2,8 @@ from enum import Enum
 import sys
 from typing import Union
 
-# flag global para habilitar debug
-DEBUG = True
+# flag global para habilitar debug (desative em produção para não frear a pesquisa)
+DEBUG = False
 
 def debug_move(depth: int, move, score: Union[float, int], forced: bool):
     """

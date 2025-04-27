@@ -18,4 +18,11 @@ class Move:
         if self.is_capture():
             return f"Capture: {' -> '.join(map(str, self.path))} | Captured: {self.captured}"
         else:
-            return f"Move: {self.path[0]} -> {self.path[-1]}" 
+            return f"Move: {self.path[0]} -> {self.path[-1]}"
+
+    def __eq__(self, other):
+        return isinstance(other, Move) and self.path == other.path and self.captured == other.captured
+
+    def __hash__(self):
+        # Permite usar Move em listas de killer e comparações
+        return hash(tuple(self.path) + tuple(self.captured)) 

@@ -6,13 +6,13 @@ import math
 from utils import debug_move, DEBUG
 
 # --- PARÂMETROS DE TUNING ---
-PST_WEIGHT           = 0.02
+PST_WEIGHT           = 0.03
 BORDER_PST_FACTOR    = 0.5
-MOBILITY_WEIGHT      = 0.1
-FUTILITY_DEPTH       = 0
+MOBILITY_WEIGHT      = 0.15
+FUTILITY_DEPTH       = 2   # habilita futility pruning até profundidade 2
 FUTILITY_MARGIN      = 0.01
 ENDGAME_PIECE_LIMIT  = 8
-ENDGAME_MULTIPLIER   = 1.0
+ENDGAME_K            = 1.0   # 0.8 → até 1 + 0.8 = 1.8 ×
 HISTORY_CUTOFF_BONUS = lambda d: d*d
 # ----------------------------
 
@@ -159,6 +159,7 @@ def generate_moves(board: Board, player: Color) -> List[Move]:
                         while True:
                             dest = Board.dark_square_index(lr, lc)
                             if dest < 0: break
+                            if dest == pos: break   # evita loop de 0 distância
                             if ((our_bb|opp_bb) & (1<<dest)) or (used_pos & (1<<dest)):
                                 break
                             found = True
@@ -302,7 +303,9 @@ def evaluate(board: Board, move_cache: Optional[Dict[Color, List[Move]]] = None)
     # Endgame material bonus
     total_pieces = white_men + white_kings + black_men + black_kings
     if total_pieces < ENDGAME_PIECE_LIMIT:
-        score *= ENDGAME_MULTIPLIER
+        # fator varia linearmente: 1.0 (limite) → 1 + ENDGAME_K (apenas 1-2 peças)
+        factor = 1.0 + ENDGAME_K * (ENDGAME_PIECE_LIMIT - total_pieces) / ENDGAME_PIECE_LIMIT
+        score *= factor
     return score
 
 def eval_side(board: Board, player: Color) -> float:
@@ -340,6 +343,8 @@ class BoundType(Enum):
 TT: Dict[Tuple[int,int,int,int,Color], Tuple[int, float, BoundType, Optional[Move]]] = {}
 # history heuristic: map (origem, destino) to score
 HISTORY: Dict[Tuple[int,int], int] = {}
+# killer heuristic: até dois movimentos por profundidade
+KILLER: List[List[Optional[Move]]] = [[None, None] for _ in range(MAX_SEARCH_DEPTH+1)]
 
 def _board_key(board: Board) -> Tuple[int,int,int,int]:
     return (
@@ -380,21 +385,22 @@ def qsearch(board: Board, alpha: float, beta: float, player: Color) -> float:
         next_b = apply_move(board, m)
         opponent = Color.WHITE if player == Color.BLACK else Color.BLACK
         score = -qsearch(next_b, -beta, -alpha, opponent)
-        # logging padronizado (forçado)
-        debug_move(0, m, score, True)
+        # logging padronizado (forçado) com depth fixo para não confundir logs
+        debug_move(-99, m, score, True)
         if score >= beta:
             return beta
         if score > alpha:
             alpha = score
     return alpha
 
+move_cache_local: Dict[Tuple, List[Move]] = {}
 def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) -> Tuple[float, Optional[Move]]:
     """Retorna (valor, melhor_move) usando Negamax + Poda Alpha-Beta."""
     global nodes, TT
     nodes += 1
     # guardo α e β originais antes de qualquer modificação em α
     alpha_orig, beta_orig = alpha, beta
-    # Transposition Table lookup
+    # Transposition Table lookup (inclui player para diferenciar cores)
     key = (*_board_key(board), player)
     if key in TT:
         d_stored, val_stored, bound_stored, mv_stored = TT[key]
@@ -408,22 +414,41 @@ def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) 
             if alpha >= beta:
                 return val_stored, mv_stored
 
+    # Null-move pruning (R=2) – cortes rápidos em posições claramente vantajosas
+    if depth >= 3 and not has_forced_capture(board, player):
+        opponent = Color.BLACK if player == Color.WHITE else Color.WHITE
+        # reduction R=2 para null-move pruning
+        null_val, _ = negamax(board, depth - 2, -beta, -beta + 1, opponent)
+        if -null_val >= beta:
+            return beta, None
+
     # nó terminal ─────────────────────────────────────────────────
     if depth == 0:
-        # quiescence somente se habilitado e posição quieta
-        if USE_QUIESCENCE and is_quiet(board, player):
+        # quiescence somente se habilitado e posição não-quieta (capturas pendentes)
+        if USE_QUIESCENCE and not is_quiet(board, player):
             val = qsearch(board, alpha, beta, player)
         else:
             val = eval_side(board, player)
         return val, None
 
     # gera e ordena movimentos (MVV-LVA)
-    moves = generate_moves(board, player)
-    move_cache = {
-        Color.WHITE: moves, 
-        Color.BLACK: generate_moves(board, Color.BLACK if player == Color.WHITE else Color.WHITE)
-    }
-    score = evaluate(board, move_cache)
+    cache_key = (*key, player)
+    if cache_key not in move_cache_local:
+        move_cache_local[cache_key] = generate_moves(board, player)
+    moves = move_cache_local[cache_key]
+    # cache de movimentos: mapeia corretamente por jogador
+    if player == Color.WHITE:
+        move_cache = {
+            Color.WHITE: moves,
+            Color.BLACK: generate_moves(board, Color.BLACK)
+        }
+    else:
+        move_cache = {
+            Color.BLACK: moves,
+            Color.WHITE: generate_moves(board, Color.WHITE)
+        }
+    if DEBUG:
+        score = evaluate(board, move_cache)
     # SEE DEBUG (temporariamente desativado): imprimindo quando haveria forced capture
     filtered_moves: List[Move] = []
     opponent = Color.BLACK if player == Color.WHITE else Color.WHITE
@@ -437,7 +462,7 @@ def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) 
                 opp_mv.is_capture() and mv.path[-1] in opp_mv.captured
                 for opp_mv in generate_moves(b2, opponent)
             )
-            if forced:
+            if forced and DEBUG:
                 debug_move(depth, mv, score, forced)
             # mantém todos os movimentos (não descarto mais)
             filtered_moves.append(mv)
@@ -452,24 +477,49 @@ def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) 
         )
     )
 
+    # killer move ordering: avalia capturas, depois killer moves, depois o resto
+    capture_moves = [m for m in moves if m.is_capture()]
+    killer_moves  = [m for m in moves if not m.is_capture() and m in KILLER[depth]]
+    other_moves   = [m for m in moves if not m.is_capture() and m not in killer_moves]
+    moves = capture_moves + killer_moves + other_moves
+
     best_val = -math.inf
     best_move: Optional[Move] = None
-    # futility pruning: descarta moves simples em profundidade rasa usando alpha original para evitar não-determinismo
-    for mv in moves:
+    # calcula total de peças para desativar futility em finais curtos
+    wm = bin(board.bitboard_white & ~board.kings_white).count("1")
+    wk = bin(board.kings_white).count("1")
+    bm = bin(board.bitboard_black & ~board.kings_black).count("1")
+    bk = bin(board.kings_black).count("1")
+    total_pieces = wm + wk + bm + bk
+    # futility pruning + LMR + killer updates
+    for move_idx, mv in enumerate(moves):
         next_board = apply_move(board, mv)
-        if depth <= FUTILITY_DEPTH and not mv.is_capture():
-            # futility pruning usando avaliação do lado atual para consistência
+        # apenas se não estivermos em final curto (menos de 6 peças) e lance simples
+        if depth <= FUTILITY_DEPTH and not mv.is_capture() and total_pieces >= 6:
             static_val = eval_side(next_board, player)
             if static_val <= alpha_orig - FUTILITY_MARGIN:
                 continue
-        val, _ = negamax(next_board, depth - 1, -beta, -alpha, opponent)
-        val = -val
+        # Late Move Reduction: lances não-capture não-killer após 8 testes em profundidade ≥3
+        if (not mv.is_capture()) and (mv not in KILLER[depth]) and move_idx >= 8 and depth >= 3:
+            val, _ = negamax(next_board, depth - 2, -beta, -alpha, opponent)
+            val = -val
+            if val > alpha:
+                val, _ = negamax(next_board, depth - 1, -beta, -alpha, opponent)
+                val = -val
+        else:
+            val, _ = negamax(next_board, depth - 1, -beta, -alpha, opponent)
+            val = -val
         if val > best_val:
             best_val, best_move = val, mv
         alpha = max(alpha, val)
         if alpha >= beta:
-            # history heuristic: penaliza movimentos não-capture que causam cutoff (ranking positivo)
+            # killer heuristic: registra corte de lances simples sem duplicar
             if not mv.is_capture():
+                if mv != KILLER[depth][0]:
+                    KILLER[depth][1] = KILLER[depth][0]
+                KILLER[depth][0] = mv
+            # history heuristic: reforça movimentos não-capture ou capturas longas efetivamente escolhidos
+            if not mv.is_capture() or len(mv.captured) > 1:
                 key_move = (mv.path[0], mv.path[-1])
                 HISTORY[key_move] = HISTORY.get(key_move, 0) + HISTORY_CUTOFF_BONUS(depth)
             break
@@ -482,19 +532,47 @@ def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) 
     else:
         bound_type = BoundType.EXACT
     TT[key] = (depth, best_val, bound_type, best_move)
-    # history heuristic: reforça movimento que foi efetivamente escolhido
-    if best_move is not None and not best_move.is_capture():
+    # history heuristic: reforça movimentos não-capture ou capturas longas efetivamente escolhidos
+    if best_move is not None and (not best_move.is_capture() or len(best_move.captured) > 1):
         key_best = (best_move.path[0], best_move.path[-1])
         HISTORY[key_best] = HISTORY.get(key_best, 0) + HISTORY_CUTOFF_BONUS(depth)
     return best_val, best_move
 
-def suggest_move(board: Board, max_depth: int = MAX_SEARCH_DEPTH, player: Color = Color.WHITE, debug: bool = False) -> Optional[Move]:
+def suggest_move(board: Board, max_depth: int = MAX_SEARCH_DEPTH, player: Color = Color.WHITE, debug: bool = False, endgame_k: float = ENDGAME_K) -> Optional[Move]:
     """Se debug=True, imprime para cada profundidade quantos nós foram buscados e o melhor movimento."""
+    global ENDGAME_K, nodes, TT
+    TT.clear()
+    for lst in KILLER:
+        lst[0] = lst[1] = None
+    HISTORY.clear()
+    ENDGAME_K = endgame_k
+    nodes = 0   # reset do contador de nós para cada chamada
+    window = 0.5      # meio peão (±50 centipawns)
+    alpha = -math.inf
+    beta  =  math.inf
+    prev_val = 0.0
     best_move: Optional[Move] = None
     for d in range(1, max_depth + 1):
+        # ajusta janela de aspiração a partir da 2ª iteração
+        if d > 1:
+            alpha = prev_val - window
+            beta  = prev_val + window
+        else:
+            alpha, beta = -math.inf, math.inf
         if debug:
             start_nodes = nodes
-        value, mv = negamax(board, d, -math.inf, math.inf, player)
+        # busca com janela de aspiração
+        value, mv = negamax(board, d, alpha, beta, player)
+        # se falhou fora da janela de aspiração, dobra-a e tenta novamente antes do fallback completo
+        if value <= alpha or value >= beta:
+            window *= 2
+            alpha = prev_val - window
+            beta  = prev_val + window
+            value, mv = negamax(board, d, alpha, beta, player)
+            # se ainda falhar, busca com janela completa
+            if value <= alpha or value >= beta:
+                value, mv = negamax(board, d, -math.inf, math.inf, player)
+        prev_val = value
         if debug:
             nodes_searched = nodes - start_nodes
             print(f"[DEBUG] Depth={d}: nodes={nodes_searched}, best_move={mv}, value={value:.2f}")
