@@ -125,13 +125,7 @@ def generate_moves(board: Board, player: Color) -> List[Move]:
             occupancy = (our_bb | opp_bb) & ~used_mid
             for dest, mid in _CAPTURE_SHIFTS[player][False][pos]:
                 if ((opp_bb >> mid) & 1) and not ((occupancy >> dest) & 1) and not (used_pos & (1 << dest)):
-                    # não promovido ainda; promoção final interrompe
-                    r_dest, _ = Board.index_to_coords(dest)
-                    promote = (player == Color.WHITE and r_dest == 7) or \
-                              (player == Color.BLACK and r_dest == 0)
-                    if promote:
-                        all_captures.append(Move(path + [dest], captured + [mid]))
-                        continue
+                    # ▶ NÃO faz promoção antecipada aqui; apenas continua a árvore de capturas
                     found = True
                     _search_man_captures(
                         dest,
@@ -397,10 +391,13 @@ move_cache_local: Dict[Tuple, List[Move]] = {}
 def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) -> Tuple[float, Optional[Move]]:
     """Retorna (valor, melhor_move) usando Negamax + Poda Alpha-Beta."""
     global nodes, TT
+    # Limpa cache de movimentos se exceder 500k entradas
+    if len(move_cache_local) > 500_000:
+        move_cache_local.clear()
     nodes += 1
     # guardo α e β originais antes de qualquer modificação em α
     alpha_orig, beta_orig = alpha, beta
-    # Transposition Table lookup (inclui player para diferenciar cores)
+    # Transposition Table lookup (inclui player)
     key = (*_board_key(board), player)
     if key in TT:
         d_stored, val_stored, bound_stored, mv_stored = TT[key]
@@ -432,7 +429,7 @@ def negamax(board: Board, depth: int, alpha: float, beta: float, player: Color) 
         return val, None
 
     # gera e ordena movimentos (MVV-LVA)
-    cache_key = key  # já inclui o player, sem duplicar
+    cache_key = key  # já contém o player, sem duplicar
     if cache_key not in move_cache_local:
         move_cache_local[cache_key] = generate_moves(board, player)
     moves = move_cache_local[cache_key]
